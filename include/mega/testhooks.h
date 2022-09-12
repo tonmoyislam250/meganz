@@ -33,25 +33,20 @@ namespace mega {
     // The preprocessor is used to ensure that code is not present for release builds, so it can't cause problems.
     // Additionally the hooks use std::function so a suitable compiler and library are needed to leverage those tests.
 
-#ifndef NDEBUG
-    #define MEGASDK_DEBUG_TEST_HOOKS_ENABLED
-#endif
+#ifdef DEBUG
 
-#ifdef MEGASDK_DEBUG_TEST_HOOKS_ENABLED
+    #define MEGASDK_DEBUG_TEST_HOOKS_ENABLED
 
     struct MEGA_API HttpReq;
     class MEGA_API RaidBufferManager;
     class DebugTestHook;
-    struct Transfer;
-    class TransferDbCommitter;
 
     struct MegaTestHooks
     {
-        std::function<bool(HttpReq*)> onHttpReqPost;
-        std::function<void(RaidBufferManager*)> onSetIsRaid;
-        std::function<void(error e)> onUploadChunkFailed;
-        std::function<bool(Transfer*, TransferDbCommitter&)> onUploadChunkSucceeded;
-        std::function<void(error e)> onDownloadFailed;
+        bool (*onHttpReqPost)(HttpReq*);
+        void (*onSetIsRaid)(RaidBufferManager*);
+
+        MegaTestHooks();
     };
 
     extern MegaTestHooks globalMegaTestHooks;
@@ -62,26 +57,11 @@ namespace mega {
     // allow the test client to confirm raid/nonraid is happening, or adjust the parameters of a raid download for smaller chunks etc
     #define DEBUG_TEST_HOOK_RAIDBUFFERMANAGER_SETISRAID(RAIDBUFMGRPTR)  { if (globalMegaTestHooks.onSetIsRaid) globalMegaTestHooks.onSetIsRaid(RAIDBUFMGRPTR); }
 
-    // watch out for upload issues
-    #define DEBUG_TEST_HOOK_UPLOADCHUNK_FAILED(X)  { if (globalMegaTestHooks.onUploadChunkFailed) globalMegaTestHooks.onUploadChunkFailed(X); }
-
-    // option to simulate something after an uploaded chunk
-    #define DEBUG_TEST_HOOK_UPLOADCHUNK_SUCCEEDED(transfer, committer)  {  \
-        if (globalMegaTestHooks.onUploadChunkSucceeded)  \
-        {                                                \
-            if (!globalMegaTestHooks.onUploadChunkSucceeded(transfer, committer)) return; \
-        }}
-
-    // watch out for download issues
-    #define DEBUG_TEST_HOOK_DOWNLOAD_FAILED(X)  { if (globalMegaTestHooks.onDownloadFailed) globalMegaTestHooks.onDownloadFailed(X); }
 
 
 #else
     #define DEBUG_TEST_HOOK_HTTPREQ_POST(x)
     #define DEBUG_TEST_HOOK_RAIDBUFFERMANAGER_SETISRAID(x)
-    #define DEBUG_TEST_HOOK_UPLOADCHUNK_FAILED(X)
-    #define DEBUG_TEST_HOOK_UPLOADCHUNK_SUCCEEDED(transfer, committer)
-    #define DEBUG_TEST_HOOK_DOWNLOAD_FAILED(X)
 #endif
 
 

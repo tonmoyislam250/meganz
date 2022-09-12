@@ -82,10 +82,12 @@ std::ostream& operator<< (std::ostream& ostr, const std::system_error &se)
 ExternalLogger::ExternalLogger()
 {
     logToConsole = false;
+    SimpleLogger::setOutputClass(this);
 }
 
 ExternalLogger::~ExternalLogger()
 {
+    SimpleLogger::setOutputClass(NULL);
 }
 
 void ExternalLogger::addMegaLogger(void* id, LogCallback lc)

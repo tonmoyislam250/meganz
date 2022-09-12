@@ -154,14 +154,12 @@ bool HttpReqCommandPutFA::procresult(Result r)
 
                         // cache resolved URLs if received
                         std::vector<string> urls(1, posturl);
-                        std::vector<string> ipsCopy = ips;
-
                         if(!cacheresolvedurls(urls, std::move(ips)))
                         {
                             LOG_err << "Unpaired IPs received for URLs in `ufa` command. URLs: " << urls.size() << " IPs: " << ips.size();
                         }
 
-                        mCompletion(API_OK, posturl, ipsCopy);
+                        mCompletion(API_OK, posturl, ips);
 
                         return true;
                     }
@@ -983,6 +981,7 @@ CommandPutNodes::CommandPutNodes(MegaClient* client, NodeHandle th,
     nn = std::move(newnodes);
     type = userhandle ? USER_HANDLE : NODE_HANDLE;
     source = csource;
+
     cmd("p");
     notself(client);
 
@@ -1546,9 +1545,8 @@ bool CommandKillSessions::procresult(Result r)
     return r.wasErrorOrOK();
 }
 
-CommandLogout::CommandLogout(MegaClient *client, Completion completion, bool keepSyncConfigsFile)
-  : mCompletion(std::move(completion))
-  , mKeepSyncConfigsFile(keepSyncConfigsFile)
+CommandLogout::CommandLogout(MegaClient *client, bool keepSyncConfigsFile)
+    : mKeepSyncConfigsFile(keepSyncConfigsFile)
 {
     cmd("sml");
 
@@ -1560,6 +1558,7 @@ CommandLogout::CommandLogout(MegaClient *client, Completion completion, bool kee
 bool CommandLogout::procresult(Result r)
 {
     assert(r.wasErrorOrOK());
+    MegaApp *app = client->app;
     if (client->loggingout > 0)
     {
         client->loggingout--;
@@ -1568,16 +1567,15 @@ bool CommandLogout::procresult(Result r)
     {
         // We are logged out, but we mustn't call locallogout until we exit this call
         // stack for processing CS batches, as it deletes data currently in use.
-        Completion completion = std::move(mCompletion);
         bool keepSyncConfigsFile = mKeepSyncConfigsFile;
-        client->mOnCSCompletion = [=](MegaClient* client){
+        client->mOnCSCompletion = [keepSyncConfigsFile](MegaClient* client){
             client->locallogout(true, keepSyncConfigsFile);
-            completion(API_OK);
+            client->app->logout_result(API_OK);
         };
     }
     else
     {
-        mCompletion(r.errorOrOK());
+        app->logout_result(r.errorOrOK());
     }
     return true;
 }
@@ -1864,13 +1862,8 @@ bool CommandLogin::procresult(Result r)
                             return true;
                         }
 
-                        byte buf[sizeof me];
-
                         // decrypt and set session ID for subsequent API communication
-                        if (!client->asymkey.decrypt(sidbuf, len_csid, sidbuf, MegaClient::SIDLEN)
-                                // additionally, check that the user's handle included in the session matches the own user's handle (me)
-                                || (Base64::atob((char*)sidbuf + SymmCipher::KEYLENGTH, buf, sizeof buf) != sizeof buf)
-                                || (me != MemAccess::get<handle>((const char*)buf)))
+                        if (!client->asymkey.decrypt(sidbuf, len_csid, sidbuf, MegaClient::SIDLEN))
                         {
                             client->app->login_result(API_EINTERNAL);
                             return true;
@@ -5373,6 +5366,7 @@ bool CommandGetPH::procresult(Result r)
                         newnode->parenthandle = UNDEF;
                         newnode->nodekey.assign((char*)key, FILENODEKEYLENGTH);
                         newnode->attrstring.reset(new string(a));
+
                         client->putnodes(client->rootnodes.files, NoVersioning, move(newnodes), nullptr, 0);
                     }
                     else if (havekey)

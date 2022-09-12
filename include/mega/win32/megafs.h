@@ -89,9 +89,6 @@ public:
 
     static void emptydirlocal(const LocalPath&, dev_t = 0);
 
-    ScanResult directoryScan(const LocalPath& path, handle expectedFsid,
-        map<LocalPath, FSNode>& known, std::vector<FSNode>& results, bool followSymlinks, unsigned& nFingerprinted) override;
-
     WinFileSystemAccess();
     ~WinFileSystemAccess();
 
@@ -106,11 +103,6 @@ public:
 #endif
 
     bool hardLink(const LocalPath& source, const LocalPath& target) override;
-
-    m_off_t availableDiskSpace(const LocalPath& drivePath) override;
-	
-private:
-    bool CheckForSymlink(const LocalPath& lp);
 };
 
 #ifdef ENABLE_SYNC

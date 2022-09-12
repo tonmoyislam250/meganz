@@ -228,7 +228,7 @@ void Model::ModelNode::generate(const fs::path& path, bool force)
     }
 }
 
-string Model::ModelNode::path() const
+string Model::ModelNode::path()
 {
     string s;
     for (auto p = this; p; p = p->parent)
@@ -236,7 +236,7 @@ string Model::ModelNode::path() const
     return s;
 }
 
-string Model::ModelNode::fsPath() const
+string Model::ModelNode::fsPath()
 {
     string s;
     for (auto p = this; p; p = p->parent)
@@ -641,125 +641,13 @@ bool waitonresults(future<bool>* r1 = nullptr, future<bool>* r2 = nullptr, futur
 
 atomic<int> next_request_tag{ 1 << 30 };
 
-CloudItem::CloudItem(const Node* node)
-  : CloudItem(*node)
-{
-}
-
-CloudItem::CloudItem(const Node& node)
-  : mNodeHandle(node.nodeHandle())
-  , mPath()
-  , mFromRoot(false)
-{
-}
-
-CloudItem::CloudItem(const string& path, bool fromRoot)
-  : CloudItem(path.c_str(), fromRoot)
-{
-}
-
-CloudItem::CloudItem(const char* path, bool fromRoot)
-  : mNodeHandle()
-  , mPath(path)
-  , mFromRoot(fromRoot)
-{
-    if (mFromRoot && path && *path == '/')
-        mPath.erase(0, 1);
-}
-
-CloudItem::CloudItem(const NodeHandle& nodeHandle)
-  : mNodeHandle(nodeHandle)
-  , mPath()
-  , mFromRoot()
-{
-}
-
-CloudItem::CloudItem(handle nodeHandle)
-  : CloudItem(NodeHandle().set6byte(nodeHandle))
-{
-}
-
-Node* CloudItem::resolve(StandardClient& client) const
-{
-    if (!mNodeHandle.isUndef())
-        return client.client.nodeByHandle(mNodeHandle);
-
-    auto* root = client.gettestbasenode();
-
-    if (mFromRoot)
-        root = client.getcloudrootnode();
-
-    return client.drillchildnodebyname(root, mPath);
-}
-
-std::set<string> declaredTestAccounts;
-
-StandardClientInUse ClientManager::getCleanStandardClient(int loginIndex, fs::path workingFolder)
-{
-    assert(loginIndex >= 0 && loginIndex < 3);
-
-    for (auto i = clients[loginIndex].begin(); i != clients[loginIndex].end(); ++i)
-    {
-        if (!i->inUse)
-        {
-            i->ptr->cleanupForTestReuse(loginIndex);
-            i->ptr->fsBasePath = i->ptr->ensureDir(workingFolder / fs::u8path(i->name));
-            return StandardClientInUse(i);
-        }
-    }
-
-    // otherwise, make a new one
-    string clientname = std::to_string(loginIndex) + "_" + std::to_string(clients[loginIndex].size());
-    fs::path localAccountRoot = makeReusableClientFolder(clientname);
-    shared_ptr<StandardClient> c(
-            new StandardClient(localAccountRoot, "client" + clientname, workingFolder));
-
-    string user = getenv(envVarAccount[loginIndex].c_str());
-    if (declaredTestAccounts.find(user) == declaredTestAccounts.end())
-    {
-        // show the email/pass so we can (a) log into the account and see what's happening
-        // and (b) add a signal to terminate very long jenkins test runs if they are already failing badly
-        string pass = getenv(envVarPass[loginIndex].c_str());
-
-        // modify pass so that it's not obscured in jenkins output... somehow it recognizes it and substitutes [*******] in the console output
-        string obfuscatedPass;
-        for (auto c : pass)
-        {
-            obfuscatedPass += "/";
-            obfuscatedPass += c;
-            obfuscatedPass += "\\";
-        }
-
-        cout << "Using test account " << loginIndex << " " << user << " " << obfuscatedPass << endl;
-        declaredTestAccounts.insert(user);
-    }
-
-    clients[loginIndex].push_back(StandardClientInUseEntry(false, c, clientname, loginIndex));
-    c->login_reset(envVarAccount[loginIndex], envVarPass[loginIndex], false, false);
-
-    c->cleanupForTestReuse(loginIndex);
-
-    return StandardClientInUse(--clients[loginIndex].end());
-}
-
-ClientManager::~ClientManager()
-{
-    while (clients.size())
-    {
-        LOG_debug << "Shutting down ClientManager, remaining: " << clients.size();
-        clients.erase(clients.begin());
-    }
-    LOG_debug << "ClientManager shutdown complete";
-}
-
 void StandardClient::ResultProc::prepresult(resultprocenum rpe, int tag, std::function<void()>&& requestfunc, std::function<bool(error)>&& f, handle h)
 {
     if (rpe != COMPLETION)
     {
         lock_guard<recursive_mutex> g(mtx);
-        auto& perTypeTags = m[rpe];
-        assert(perTypeTags.find(tag) == perTypeTags.end());
-        perTypeTags.emplace(tag, id_callback(move(f), tag, h));
+        auto& entry = m[rpe];
+        entry.emplace_back(move(f), tag, h);
     }
 
     std::lock_guard<std::recursive_mutex> lg(client.clientMutex);
@@ -769,7 +657,6 @@ void StandardClient::ResultProc::prepresult(resultprocenum rpe, int tag, std::fu
     client.client.reqtag = tag;
     requestfunc();
     client.client.reqtag = oldtag;
-    LOG_debug << "tag-result prepared for operation " << rpe << " tag " << tag;
 
     client.client.waiter->notify();
 }
@@ -796,8 +683,8 @@ void StandardClient::ResultProc::processresult(resultprocenum rpe, error e, hand
     {
         while (!entry.empty())
         {
-            entry.begin()->second.f(e);
-            entry.erase(entry.begin());
+            entry.front().f(e);
+            entry.pop_front();
         }
         return;
     }
@@ -809,17 +696,16 @@ void StandardClient::ResultProc::processresult(resultprocenum rpe, error e, hand
         return;
     }
 
-    auto it = entry.find(tag);
-    if (it == entry.end())
+    if (tag != entry.front().request_tag)
     {
         out() << client.client.clientname
-              << "tag not found for operation completion of " << rpe << " tag " << tag;
+                << "tag mismatch for operation completion of " << rpe << " tag " << tag << ", we expected " << entry.front().request_tag;
         return;
     }
 
-    if (it->second.f(e))
+    if (entry.front().f(e))
     {
-        entry.erase(it);
+        entry.pop_front();
     }
 }
 
@@ -882,17 +768,20 @@ StandardClient::StandardClient(const fs::path& basepath, const string& name, con
 
 StandardClient::~StandardClient()
 {
-    LOG_debug << "StandardClient exiting";
+    // shut down any syncs on the same thread, or they stall the client destruction (CancelIo instead of CancelIoEx on the WinDirNotify)
+    auto result =
+        thread_do<bool>([](MegaClient& mc, PromiseBoolSP result)
+                        {
+                            mc.logout(false);
+                            result->set_value(true);
+                        });
 
     // Make sure logout completes before we escape.
-    logout(false);
-
-    LOG_debug << "~StandardClient final logout complete";
+    result.get();
 
     clientthreadexit = true;
     waiter.notify();
     clientthread.join();
-    LOG_debug << "~StandardClient end of function (work thread joined)";
 }
 
 void StandardClient::localLogout()
@@ -902,25 +791,21 @@ void StandardClient::localLogout()
                         {
                             mc.locallogout(false, true);
                             result->set_value(true);
-                        },
-                        __FILE__, __LINE__);
+                        });
 
     // Make sure logout completes before we escape.
     result.get();
 }
 
-bool StandardClient::logout(bool keepSyncsConfigFile)
+void StandardClient::logout(bool keepSyncsConfigFile)
 {
     auto result = thread_do<bool>([=](MegaClient& client, PromiseBoolSP result) {
-        client.logout(keepSyncsConfigFile, [=](error e) {
-            result->set_value(e == API_OK);
-        });
-    }, __FILE__, __LINE__);
+        client.logout(keepSyncsConfigFile);
+        result->set_value(true);
+    });
 
-    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
-        return false;
-
-    return result.get();
+    // Wait for the logout to complete before escaping.
+    result.get();
 }
 
 string StandardClient::lp(LocalNode* ln) { return ln->getLocalPath().toName(*client.fsaccess); }
@@ -996,34 +881,6 @@ void StandardClient::syncupdate_stateconfig(const SyncConfig& config)
     if (mOnSyncStateConfig)
         mOnSyncStateConfig(config);
 }
-
-void StandardClient::useralerts_updated(UserAlert::Base** alerts, int numAlerts)
-{
-    if (logcb)
-    {
-        lock_guard<mutex> guard(om);
-
-        out() << clientname
-              << "useralerts_updated: received "
-              << numAlerts;
-    }
-
-    received_user_alerts = true;
-    user_alerts_updated_cv.notify_all();
-}
-
-bool StandardClient::waitForUserAlertsUpdated(unsigned numSeconds)
-{
-    std::mutex mutex;
-    std::unique_lock<std::mutex> guard(mutex);
-
-    user_alerts_updated_cv.wait_for(guard, std::chrono::seconds(numSeconds), [&] {
-        return received_user_alerts;
-    });
-
-    return received_user_alerts;
-}
-
 void StandardClient::syncupdate_scanning(bool b) { if (logcb) { onCallback(); lock_guard<mutex> g(om); out() << clientname << " syncupdate_scanning()" << b; } }
 void StandardClient::syncupdate_local_lockretry(bool b) { if (logcb) { onCallback(); lock_guard<mutex> g(om); out() << clientname << "syncupdate_local_lockretry() " << b; }}
 
@@ -1152,14 +1009,8 @@ void StandardClient::threadloop()
             client.waiter->bumpds();
             auto start = client.waiter->ds;
             std::lock_guard<mutex> g(functionDoneMutex);
-            string sourcefile;
-            int sourceline = -1;
             if (nextfunctionMC)
             {
-                sourcefile = nextfunctionMC_sourcefile;
-                sourceline = nextfunctionMC_sourceline;
-                nextfunctionMC_sourcefile = "";
-                nextfunctionMC_sourceline = -1;
                 nextfunctionMC();
                 nextfunctionMC = nullptr;
                 functionDone.notify_all();
@@ -1167,10 +1018,6 @@ void StandardClient::threadloop()
             }
             if (nextfunctionSC)
             {
-                sourcefile = nextfunctionSC_sourcefile;
-                sourceline = nextfunctionSC_sourceline;
-                nextfunctionSC_sourcefile = "";
-                nextfunctionSC_sourceline = -1;
                 nextfunctionSC();
                 nextfunctionSC = nullptr;
                 functionDone.notify_all();
@@ -1181,9 +1028,8 @@ void StandardClient::threadloop()
             if (end - start > 200)
             {
                 // note that in Debug builds (for windows at least), prep for logging in can take 15 seconds in pbkdf2.DeriveKey
-                LOG_err << "test functions passed to be executed on the client thread should queue work but not wait for the results themselves. Waited ms: "
-                        << end-start << " in " << sourcefile << " line " << sourceline;
-                //assert(false);
+                LOG_err << "test functions passed to be executed on the client thread should queue work but not wait for the results themselves";
+                assert(false);
             }
         }
 
@@ -1271,166 +1117,90 @@ void StandardClient::loginFromSession(const string& session, PromiseBoolSP pb)
         [pb](error e) { pb->set_value(!e);  return true; });
 }
 
-bool StandardClient::copy(const CloudItem& source,
-                          const CloudItem& target,
-                          const string& name,
-                          VersioningOption versioningPolicy)
+bool StandardClient::cloudCopyTreeAs(Node* from, Node* to, string name)
 {
-    auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
-        client.copy(source, target, name, std::move(result), versioningPolicy);
-    }, __FILE__, __LINE__);
+    auto promise = makeSharedPromise<bool>();
+    auto future = promise->get_future();
 
-    auto status = result.wait_for(std::chrono::minutes(2));
+    cloudCopyTreeAs(from, to, std::move(name), std::move(promise));
 
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
-
-    return result.get();
+    return future.get();
 }
 
-bool StandardClient::copy(const CloudItem& source,
-                          const CloudItem& target,
-                          VersioningOption versioningPolicy)
+
+void StandardClient::cloudCopyTreeAs(Node* n1, Node* n2, std::string newname, PromiseBoolSP pb)
 {
-    return copy(source, target, string(), versioningPolicy);
-}
-
-void StandardClient::copy(const CloudItem& source,
-                          const CloudItem& target,
-                          string name,
-                          PromiseBoolSP result,
-                          VersioningOption versioningPolicy)
-{
-    auto* sourceNode = source.resolve(*this);
-    EXPECT_TRUE(sourceNode);
-
-    if (!sourceNode)
-        return result->set_value(false);
-
-    auto* targetNode = target.resolve(*this);
-    EXPECT_TRUE(targetNode);
-
-    if (!targetNode || targetNode->type == FILENODE)
-        return result->set_value(false);
-
-    // Make sure name always contains something valid.
-    if (name.empty())
-        name = sourceNode->displayname();
-
-    // Make sure name is normalized.
-    LocalPath::utf8_normalize(&name);
-
-    TreeProcCopy proc;
-
-    // Figure out how many nodes we need to copy.
-    client.proctree(sourceNode, &proc, false, true);
-
-    // Allocate and populate nodes.
-    proc.allocnodes();
-
-    client.proctree(sourceNode, &proc, false, true);
-
-    // We need the original node's handle if we're using versioning.
-    Node* victimNode = nullptr;
-
-    if (versioningPolicy != NoVersioning)
-        victimNode = client.childnodebyname(targetNode, name.c_str(), true);
-
-    if (victimNode)
-        proc.nn[0].ovhandle = victimNode->nodeHandle();
-
-    proc.nn[0].parenthandle = UNDEF;
-
-    // Populate attributes of copied node.
-    {
-        SymmCipher key;
-
-        // Load key.
-        key.setkey((const ::mega::byte*)proc.nn[0].nodekey.data(), sourceNode->type);
-
-        // Copy existing attributes.
-        AttrMap attrs = sourceNode->attrs;
-
-        // Upate the node's name.
-        attrs.map['n'] = std::move(name);
-
-        // Generate attribute string.
-        string attrstring;
-
-        attrs.getjson(&attrstring);
-
-        // Update node's attribute string.
-        client.makeattr(&key, proc.nn[0].attrstring, attrstring.c_str());
-    }
-
-    auto completion = [=](const Error& error) {
-        LOG_debug << "Putnodes request completed: "
-                  << error;
-
-        EXPECT_EQ(error, API_OK);
-        result->set_value(error == API_OK);
-    };
-
-    LOG_debug << "Scheduling putnodes request now...";
-
-    client.putnodes(targetNode->nodeHandle(),
-                    versioningPolicy,
-                    std::move(proc.nn),
-                    nullptr,
-                    0,
-                    BasicPutNodesCompletion(std::move(completion)));
-}
-
-bool StandardClient::putnodes(const CloudItem& parent,
-                              VersioningOption versioningPolicy,
-                              std::vector<NewNode>&& nodes)
-{
-    auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
-        client.putnodes(parent,
-                        versioningPolicy,
-                        std::move(nodes),
-                        std::move(result));
-    }, __FILE__, __LINE__);
-
-    auto status = result.wait_for(std::chrono::seconds(40));
-
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
-
-    return result.get();
-}
-
-void StandardClient::putnodes(const CloudItem& parent,
-                              VersioningOption versioningPolicy,
-                              std::vector<NewNode>&& nodes,
-                              PromiseBoolSP result)
-{
-    auto* node = parent.resolve(*this);
-    EXPECT_TRUE(node);
-
-    if (!node)
-        return result->set_value(false);
-
-    auto completion = BasicPutNodesCompletion([result](const Error& e) {
-        LOG_debug << "Putnodes request completed: "
-                  << e;
-
-        EXPECT_EQ(e, API_OK);
-        result->set_value(e == API_OK);
+    auto completion = BasicPutNodesCompletion([pb](const Error& e) {
+        pb->set_value(!e);
     });
 
-    LOG_debug << "Scheduling putnodes request now...";
+    resultproc.prepresult(COMPLETION, ++next_request_tag,
+        [&](){
+            TreeProcCopy tc;
+            client.proctree(n1, &tc, false, true);
+            tc.allocnodes();
+            client.proctree(n1, &tc, false, true);
+            tc.nn[0].parenthandle = UNDEF;
 
-    client.putnodes(node->nodeHandle(),
-                    versioningPolicy,
-                    std::move(nodes),
-                    nullptr,
-                    0,
-                    std::move(completion));
+            SymmCipher key;
+            AttrMap attrs;
+            string attrstring;
+            key.setkey((const ::mega::byte*)tc.nn[0].nodekey.data(), n1->type);
+            attrs = n1->attrs;
+            LocalPath::utf8_normalize(&newname);
+            attrs.map['n'] = newname;
+            attrs.getjson(&attrstring);
+            client.makeattr(&key, tc.nn[0].attrstring, attrstring.c_str());
+            client.putnodes(n2->nodeHandle(), NoVersioning, move(tc.nn), nullptr, 0, std::move(completion));
+        },
+        nullptr);
+}
+
+void StandardClient::putnodes(NodeHandle parentHandle, VersioningOption vo, std::vector<NewNode>&& nodes, PromiseBoolSP pb)
+{
+    auto completion = BasicPutNodesCompletion([pb](const Error& e) {
+        pb->set_value(!e);
+    });
+
+    resultproc.prepresult(COMPLETION,
+                            ++next_request_tag,
+                            [&]()
+                            {
+                                client.putnodes(parentHandle, vo, std::move(nodes), nullptr, 0, std::move(completion));
+                            },
+                            nullptr);
+}
+
+bool StandardClient::putnodes(NodeHandle parentHandle, VersioningOption vo, std::vector<NewNode>&& nodes)
+{
+    auto result =
+        thread_do<bool>([&](StandardClient& client, PromiseBoolSP pb)
+                {
+                    client.putnodes(parentHandle, vo, std::move(nodes), pb);
+                });
+
+    return result.get();
+}
+
+void StandardClient::putnodes(const string& parentPath, VersioningOption vo, std::vector<NewNode>&& nodes, PromiseBoolSP result)
+{
+    if (auto* parent = drillchildnodebyname(gettestbasenode(), parentPath))
+    {
+        putnodes(parent->nodeHandle(), vo, std::move(nodes), std::move(result));
+    }
+    else
+    {
+        result->set_value(false);
+    }
+}
+
+bool StandardClient::putnodes(const string &parentPath, VersioningOption vo, std::vector<NewNode>&& nodes)
+{
+    auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
+        client.putnodes(parentPath, vo, std::move(nodes), std::move(result));
+    });
+
+    return result.get();
 }
 
 void StandardClient::uploadFolderTree_recurse(handle parent, handle& h, const fs::path& p, vector<NewNode>& newnodes)
@@ -1466,49 +1236,29 @@ void StandardClient::uploadFolderTree(fs::path p, Node* n2, PromiseBoolSP pb)
         nullptr);
 }
 
-void StandardClient::downloadFile(const CloudItem& item, const fs::path& destination, PromiseBoolSP result)
+void StandardClient::downloadFile(const Node& node, const fs::path& destination, PromiseBoolSP result)
 {
-    auto* node = item.resolve(*this);
-    if (!node)
-        return result->set_value(false);
-
     unique_ptr<FileGet> file(new FileGet());
 
-    file->h = node->nodeHandle();
+    file->h = node.nodeHandle();
     file->hprivate = true;
     file->localname = LocalPath::fromAbsolutePath(destination.u8string());
-    file->name = node->displayname();
+    file->name = node.displayname();
     file->result = std::move(result);
 
-    reinterpret_cast<FileFingerprint&>(*file) = *node;
+    reinterpret_cast<FileFingerprint&>(*file) = node;
 
-    TransferDbCommitter committer(client.tctable);
-
-    error r = API_OK;
-
-    client.startxfer(GET, file.get(), committer, false, false, false, NoVersioning, &r);
-    EXPECT_EQ(r , API_OK);
-
-    if (r != API_OK)
-        return file->result->set_value(false);
-
-    file.release();
+    DBTableTransactionCommitter committer(client.tctable);
+    client.startxfer(GET, file.release(), committer, false, false, false, NoVersioning);
 }
 
-bool StandardClient::downloadFile(const CloudItem& item, const fs::path& destination)
+bool StandardClient::downloadFile(const Node& node, const fs::path& destination)
 {
     auto result =
         thread_do<bool>([&](StandardClient& client, PromiseBoolSP result)
                         {
-                            client.downloadFile(item, destination, result);
-                        }, __FILE__, __LINE__);
-
-    auto status = result.wait_for(DEFAULTWAIT);
-
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
+                            client.downloadFile(node, destination, result);
+                        });
 
     return result.get();
 }
@@ -1523,7 +1273,7 @@ bool StandardClient::uploadFolderTree(fs::path p, Node* n2)
     return future.get();
 }
 
-void StandardClient::uploadFile(const fs::path& path, const string& name, const Node* parent, TransferDbCommitter& committer, VersioningOption vo)
+void StandardClient::uploadFile(const fs::path& path, const string& name, const Node* parent, DBTableTransactionCommitter& committer, VersioningOption vo)
 {
     unique_ptr<File> file(new FilePut());
 
@@ -1531,9 +1281,7 @@ void StandardClient::uploadFile(const fs::path& path, const string& name, const 
     file->localname = LocalPath::fromAbsolutePath(path.u8string());
     file->name = name;
 
-    error result = API_OK;
-    client.startxfer(PUT, file.release(), committer, false, false, false, vo, &result);
-    EXPECT_EQ(result, API_OK);
+    client.startxfer(PUT, file.release(), committer, false, false, false, vo);
 }
 
 void StandardClient::uploadFile(const fs::path& path, const string& name, const Node* parent, PromiseBoolSP pb, VersioningOption vo)
@@ -1542,7 +1290,7 @@ void StandardClient::uploadFile(const fs::path& path, const string& name, const 
                             ++next_request_tag,
                             [&]()
                             {
-                                TransferDbCommitter committer(client.tctable);
+                                DBTableTransactionCommitter committer(client.tctable);
                                 uploadFile(path, name, parent, committer, vo);
                             },
                             [pb](error e)
@@ -1552,31 +1300,55 @@ void StandardClient::uploadFile(const fs::path& path, const string& name, const 
                             });
 }
 
-bool StandardClient::uploadFile(const fs::path& path, const string& name, const CloudItem& parent, int timeoutSeconds, VersioningOption vo)
+bool StandardClient::uploadFile(const fs::path& path, const string& name, const Node* parent, int timeoutSeconds, VersioningOption vo)
 {
-    auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP pb) {
-        auto* parentNode = parent.resolve(client);
-        if (!parentNode)
-            return pb->set_value(false);
+    auto result =
+        thread_do<bool>([&](StandardClient& client, PromiseBoolSP pb)
+            {
+                client.uploadFile(path, name, parent, pb, vo);
+            });
 
-        client.uploadFile(path, name, parentNode, pb, vo);
-    }, __FILE__, __LINE__);
-
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(std::chrono::seconds(timeoutSeconds)) != std::future_status::ready)
+    {
+        LOG_warn << "Timed out waiting for uplaodFile";
         return false;
-
+    }
     return result.get();
 }
 
-bool StandardClient::uploadFile(const fs::path& path, const CloudItem& parent, int timeoutSeconds, VersioningOption vo)
+bool StandardClient::uploadFile(const fs::path& path, const string& name, string parentPath, int timeoutSeconds, VersioningOption vo)
+{
+    auto result =
+        thread_do<bool>([&](StandardClient& client, PromiseBoolSP pb)
+            {
+                const Node* parent = client.client.nodeByPath(parentPath.c_str(), nullptr);
+                if (!parent)
+                {
+                    LOG_warn << "nodeByPath found no node for parentPath " << parentPath << ", cannot call uploadFile";
+                    return pb->set_value(false);
+                }
+                client.uploadFile(path, name, parent, pb, vo);
+            });
+
+    if (result.wait_for(std::chrono::seconds(timeoutSeconds)) != std::future_status::ready)
+    {
+        LOG_warn << "Timed out waiting for uploadFile";
+        return false;
+    }
+    return result.get();
+}
+
+bool StandardClient::uploadFile(const fs::path& path, const Node* parent, int timeoutSeconds, VersioningOption vo)
 {
     return uploadFile(path, path.filename().u8string(), parent, timeoutSeconds, vo);
 }
 
-void StandardClient::uploadFilesInTree_recurse(const Node* target, const fs::path& p, std::atomic<int>& inprogress, TransferDbCommitter& committer, VersioningOption vo)
+bool StandardClient::uploadFile(const fs::path& path, const string& parentPath, int timeoutSeconds, VersioningOption vo)
+{
+    return uploadFile(path, path.filename().u8string(), parentPath, timeoutSeconds, vo);
+}
+
+void StandardClient::uploadFilesInTree_recurse(const Node* target, const fs::path& p, std::atomic<int>& inprogress, DBTableTransactionCommitter& committer, VersioningOption vo)
 {
     if (fs::is_regular_file(p))
     {
@@ -1595,7 +1367,7 @@ void StandardClient::uploadFilesInTree_recurse(const Node* target, const fs::pat
     }
 }
 
-bool StandardClient::uploadFilesInTree(fs::path p, const CloudItem& n2, VersioningOption vo)
+bool StandardClient::uploadFilesInTree(fs::path p, const Node* n2, VersioningOption vo)
 {
     auto promise = makeSharedPromise<bool>();
     auto future = promise->get_future();
@@ -1603,34 +1375,15 @@ bool StandardClient::uploadFilesInTree(fs::path p, const CloudItem& n2, Versioni
     std::atomic_int dummy(0);
     uploadFilesInTree(p, n2, dummy, std::move(promise), vo);
 
-    auto status = future.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
-
     return future.get();
 }
 
-void StandardClient::uploadFilesInTree(fs::path p, const CloudItem& n2, std::atomic<int>& inprogress, PromiseBoolSP pb, VersioningOption vo)
+void StandardClient::uploadFilesInTree(fs::path p, const Node* n2, std::atomic<int>& inprogress, PromiseBoolSP pb, VersioningOption vo)
 {
-    Node* targetNode = nullptr;
-
-    {
-        lock_guard<recursive_mutex> guard(clientMutex);
-        targetNode = n2.resolve(*this);
-    }
-
-    // The target node should always exist.
-    EXPECT_TRUE(targetNode);
-
-    if (!targetNode && !inprogress)
-        return pb->set_value(false);
-
     resultproc.prepresult(PUTNODES, ++next_request_tag,
         [&](){
-            TransferDbCommitter committer(client.tctable);
-            uploadFilesInTree_recurse(targetNode, p, inprogress, committer, vo);
+            DBTableTransactionCommitter committer(client.tctable);
+            uploadFilesInTree_recurse(n2, p, inprogress, committer, vo);
         },
         [pb, &inprogress](error e)
         {
@@ -1642,7 +1395,7 @@ void StandardClient::uploadFilesInTree(fs::path p, const CloudItem& n2, std::ato
 
 void StandardClient::uploadFile(const fs::path& sourcePath,
                                 const string& targetName,
-                                const CloudItem& parent,
+                                const Node& parent,
                                 std::function<void(error)> completion,
                                 const VersioningOption versioningPolicy)
 {
@@ -1660,7 +1413,6 @@ void StandardClient::uploadFile(const fs::path& sourcePath,
                                            targettype_t,
                                            vector<NewNode>&,
                                            bool) {
-                EXPECT_EQ(result, API_OK);
                 completion(result);
             };
 
@@ -1672,7 +1424,6 @@ void StandardClient::uploadFile(const fs::path& sourcePath,
                          source,
                          NodeHandle(),
                          std::move(trampoline),
-                         nullptr,
                          nullptr);
 
             // Destroy ourselves.
@@ -1681,8 +1432,6 @@ void StandardClient::uploadFile(const fs::path& sourcePath,
 
         void terminated(error result)
         {
-            EXPECT_FALSE(true);
-
             // Let the completion function know we've failed.
             mCompletion(result);
 
@@ -1694,46 +1443,32 @@ void StandardClient::uploadFile(const fs::path& sourcePath,
         std::function<void(error)> mCompletion;
     }; // Put
 
-    // Make sure we have exclusive access to the client.
-    lock_guard<recursive_mutex> guard(clientMutex);
-
-    auto* parentNode = parent.resolve(*this);
-    if (!parentNode)
-        return completion(API_ENOENT);
-
     // Create a file to represent and track our upload.
     auto file = ::mega::make_unique<Put>();
 
     // Populate necessary fields.
-    file->h = parentNode->nodeHandle();
+    file->h = parent.nodeHandle();
     file->mCompletion = std::move(completion);
     file->name = targetName;
     file->localname = LocalPath::fromAbsolutePath(sourcePath.u8string());
 
-    // Kick off the upload. Client takes ownership of file.
-    TransferDbCommitter committer(client.tctable);
+    // Make sure we have exclusive access to the client.
+    lock_guard<recursive_mutex> guard(clientMutex);
 
-    error result = API_OK;
+    // Kick off the upload. Client takes ownership of file.
+    DBTableTransactionCommitter committer(client.tctable);
 
     client.startxfer(PUT,
-                     file.get(),
+                     file.release(),
                      committer,
                      false,
                      false,
                      false,
-                     versioningPolicy,
-                     &result);
-
-    EXPECT_EQ(result, API_OK);
-
-    if (result != API_OK)
-        return file->mCompletion(result);
-
-    file.release();
+                     versioningPolicy);
 }
 
 void StandardClient::uploadFile(const fs::path& sourcePath,
-                                const CloudItem& parent,
+                                const Node& parent,
                                 std::function<void(error)> completion,
                                 const VersioningOption versioningPolicy)
 {
@@ -1779,17 +1514,13 @@ bool StandardClient::fetchnodes(bool noCache)
         thread_do<bool>([=](StandardClient& client, PromiseBoolSP result)
                         {
                             client.fetchnodes(noCache, result);
-                        }, __FILE__, __LINE__);
+                        });
 
-    auto status = result.wait_for(std::chrono::seconds(180));
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(std::chrono::seconds(180)) != std::future_status::ready)
     {
         LOG_warn << "Timed out waiting for fetchnodes";
         return false;
     }
-
     return result.get();
 }
 
@@ -1805,21 +1536,13 @@ void StandardClient::catchup(std::function<void(error)> completion)
     auto init = std::bind(&MegaClient::catchup, &client);
 
     auto fini = [completion](error e) {
-        LOG_debug << "catchup(...) request completed: "
-                  << e;
-
-        EXPECT_EQ(e, API_OK);
         if (e)
             out() << "catchup reports: " << e;
-
-        LOG_debug << "Calling catchup(...) completion function...";
 
         completion(e);
 
         return true;
     };
-
-    LOG_debug << "Sending catchup(...) request...";
 
     resultproc.prepresult(CATCHUP,
                           ++next_request_tag,
@@ -1836,7 +1559,7 @@ unsigned StandardClient::deleteTestBaseFolder(bool mayNeedDeleting)
 {
     auto result = thread_do<unsigned>([=](StandardClient& client, PromiseUnsignedSP result) {
         client.deleteTestBaseFolder(mayNeedDeleting, false, std::move(result));
-    }, __FILE__, __LINE__);
+    });
 
     return result.get();
 }
@@ -1850,7 +1573,6 @@ void StandardClient::deleteTestBaseFolder(bool mayNeedDeleting, bool deleted, Pr
             if (mayNeedDeleting)
             {
                 auto completion = [this, result](NodeHandle, Error e) {
-                    EXPECT_EQ(e, API_OK);
                     if (e) out() << "delete of test base folder reply reports: " << e;
                     deleteTestBaseFolder(false, true, result);
                 };
@@ -1881,13 +1603,11 @@ void StandardClient::ensureTestBaseFolder(bool mayneedmaking, PromiseBoolSP pb)
     {
         if (Node* basenode = client.childnodebyname(root, "mega_test_sync", false))
         {
-            out() << clientname << "ensureTestBaseFolder node found";
             if (basenode->type == FOLDERNODE)
             {
                 basefolderhandle = basenode->nodehandle;
                 //out() << clientname << " Base folder: " << Base64Str<MegaClient::NODEHANDLE>(basefolderhandle);
                 //parentofinterest = Base64Str<MegaClient::NODEHANDLE>(basefolderhandle);
-                out() << clientname << "ensureTestBaseFolder ok";
                 pb->set_value(true);
                 return;
             }
@@ -1897,22 +1617,16 @@ void StandardClient::ensureTestBaseFolder(bool mayneedmaking, PromiseBoolSP pb)
             vector<NewNode> nn(1);
             nn[0] = makeSubfolder("mega_test_sync");
 
-            resultproc.prepresult(PUTNODES, ++next_request_tag,
-                [&](){
-                    client.putnodes(root->nodeHandle(), NoVersioning, move(nn), nullptr, client.reqtag, nullptr);
-                },
-                [pb, this](error e){
-                    out() << clientname << "ensureTestBaseFolder putnodes completed with: " << e;
-                    ensureTestBaseFolder(false, pb);
-                    return true;
-                });
-            out() << clientname << "ensureTestBaseFolder sending putnodes";
+            auto completion = BasicPutNodesCompletion([this, pb](const Error&) {
+                ensureTestBaseFolder(false, pb);
+            });
+
+            resultproc.prepresult(COMPLETION, ++next_request_tag,
+                [&](){ client.putnodes(root->nodeHandle(), NoVersioning, move(nn), nullptr, 0, std::move(completion)); },
+                nullptr);
+
             return;
         }
-        out() << clientname << "ensureTestBaseFolder unexpected case"; // but can occur if we look too early because a late actionpacket from prior tests made us think it was time to check
-    }
-    else {
-        out() << clientname << "no file root handle";
     }
     pb->set_value(false);
 }
@@ -1940,7 +1654,7 @@ bool StandardClient::makeCloudSubdirs(const string& prefix, int depth, int fanou
         thread_do<bool>([=](StandardClient& client, PromiseBoolSP result)
                         {
                             client.makeCloudSubdirs(prefix, depth, fanout, result);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
@@ -1999,13 +1713,7 @@ SyncConfig StandardClient::syncConfigByBackupID(handle backupID) const
 bool StandardClient::syncSet(handle backupId, SyncInfo& info) const
 {
     SyncConfig c;
-
-    auto found = client.syncs.syncConfigByBackupId(backupId, c);
-    EXPECT_TRUE(found)
-      << "Unable to find sync with backup ID: "
-      << toHandle(backupId);
-
-    if (found)
+    if (client.syncs.syncConfigByBackupId(backupId, c))
     {
         info.h = c.mRemoteNode;
         info.localpath = c.getLocalPath().toPath();
@@ -2088,40 +1796,126 @@ vector<Node*> StandardClient::drillchildnodesbyname(Node* n, const string& path)
     }
 }
 
-handle StandardClient::setupSync_mainthread(const string& rootPath,
-                                            const CloudItem& remoteItem,
-                                            const bool isBackup,
-                                            const bool uploadIgnoreFile,
-                                            const string& drivePath)
+void StandardClient::backupAdd_inthread(const string& drivePath,
+                        string sourcePath,
+                        const string& targetPath,
+                        std::function<void(error, SyncError, handle)> completion,
+                        const string& logname)
 {
+    auto* rootNode = client.nodebyhandle(basefolderhandle);
+
+    // Root isn't in the cloud.
+    if (!rootNode)
+    {
+        return;
+    }
+
+    auto* targetNode = drillchildnodebyname(rootNode, targetPath);
+
+    // Target path doesn't exist.
+    if (!targetNode)
+    {
+        return;
+    }
+
+    // Generate drive ID if necessary.
+    auto id = UNDEF;
+    auto result = readDriveId(*client.fsaccess, drivePath.c_str(), id);
+
+    if (result == API_ENOENT)
+    {
+        id = generateDriveId(client.rng);
+        result = writeDriveId(*client.fsaccess, drivePath.c_str(), id);
+    }
+
+    if (result != API_OK)
+    {
+        completion(result, NO_SYNC_ERROR, UNDEF);
+        return;
+    }
+
+    auto config =
+        SyncConfig(LocalPath::fromAbsolutePath(sourcePath),
+                    sourcePath,
+                    targetNode->nodeHandle(),
+                    targetNode->displaypath(),
+                    0,
+                    LocalPath::fromAbsolutePath(drivePath),
+                    //string_vector(),
+                    true,
+                    SyncConfig::TYPE_BACKUP);
+
+    EXPECT_TRUE(!config.mOriginalPathOfRemoteRootNode.empty() &&
+        config.mOriginalPathOfRemoteRootNode.front() == '/')
+        << "config.mOriginalPathOfRemoteRootNode: " << config.mOriginalPathOfRemoteRootNode.c_str();
+
+
+    // Try and add the backup.  Result via completion
+    client.addsync(config, true, completion, logname);
+}
+
+handle StandardClient::backupAdd_mainthread(const string& drivePath,
+                            const string& sourcePath,
+                            const string& targetPath,
+                            const string& logname)
+{
+    const fs::path dp = fsBasePath / fs::u8path(drivePath);
+    const fs::path sp = fsBasePath / fs::u8path(sourcePath);
+
+    fs::create_directories(dp);
+    fs::create_directories(sp);
+
+    auto result =
+        thread_do<handle>(
+        [&](StandardClient& client, PromiseHandleSP result)
+        {
+            auto completion =
+                [=](error e, SyncError, handle backupId)
+                {
+                result->set_value(backupId);
+                };
+
+                client.backupAdd_inthread(dp.u8string(),
+                                        sp.u8string(),
+                                        targetPath,
+                                        std::move(completion),
+                                        logname);
+        });
+
+    return result.get();
+}
+
+handle StandardClient::setupSync_mainthread(const string& localPath,
+                                            const Node& remoteNode,
+                                            const bool isBackup,
+                                            const bool uploadIgnoreFile)
+{
+    if (remoteNode.client != &client)
+        return setupSync_mainthread(localPath,
+                                    remoteNode.nodehandle,
+                                    isBackup,
+                                    uploadIgnoreFile);
+
     auto result = thread_do<handle>([&](StandardClient& client, PromiseHandleSP result) {
-        client.setupSync_inThread(drivePath,
-                                  rootPath,
-                                  remoteItem,
+        client.setupSync_inThread(localPath,
+                                  remoteNode,
                                   isBackup,
                                   uploadIgnoreFile,
                                   std::move(result));
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(std::chrono::seconds(45));
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return UNDEF;
 
     return result.get();
 }
 
-void StandardClient::setupSync_inThread(const string& drivePath,
-                                        const string& rootPath,
-                                        const CloudItem& remoteItem,
+void StandardClient::setupSync_inThread(const string& localPath,
+                                        const Node& remoteNode,
                                         const bool isBackup,
                                         const bool,
                                         PromiseHandleSP result)
 {
-    // Helpful sentinel.
-    static const string internalDrive(1, '\0');
-
     // Check if node is (or is contained by) an in-share.
     auto isShare = [](const Node* node) {
         for ( ; node; node = node->parent) {
@@ -2135,70 +1929,33 @@ void StandardClient::setupSync_inThread(const string& drivePath,
         return false;
     };
 
-    auto* remoteNode = remoteItem.resolve(*this);
-    EXPECT_TRUE(remoteNode);
-
-    if (!remoteNode)
-        return result->set_value(UNDEF);
+    // Sanity.
+    assert(remoteNode.client == &client);
 
     auto ec = std::error_code();
-    auto rootPath_ = fsBasePath / fs::u8path(rootPath);
+    auto rootPath = fsBasePath / fs::u8path(localPath);
 
     // Try and create the local sync root.
-    fs::create_directories(rootPath_, ec);
-    EXPECT_FALSE(ec);
+    fs::create_directory(rootPath, ec);
 
     if (ec)
         return result->set_value(UNDEF);
 
-    fs::path drivePath_;
-
-    // Populate drive root if necessary.
-    if (drivePath != internalDrive)
-    {
-        // Path should be valid as syncs must be contained by their drive.
-        drivePath_ = fsBasePath / fs::u8path(drivePath);
-
-        // Read drive ID if present...
-        auto fsAccess = client.fsaccess.get();
-        auto id = UNDEF;
-        auto path = drivePath_.u8string();
-        auto result_ = readDriveId(*fsAccess, path.c_str(), id);
-
-        // Generate one if not...
-        if (result_ == API_ENOENT)
-        {
-            id = generateDriveId(client.rng);
-            result_ = writeDriveId(*fsAccess, path.c_str(), id);
-        }
-
-        EXPECT_EQ(result_, API_OK);
-    }
-
     // For purposes of capturing.
-    auto remoteHandle = remoteNode->nodeHandle();
-    auto remoteIsShare = isShare(remoteNode);
-    auto remotePath = string(remoteNode->displaypath());
+    auto remoteHandle = remoteNode.nodeHandle();
+    auto remoteIsShare = isShare(&remoteNode);
+    auto remotePath = string(remoteNode.displaypath());
 
     // Called when it's time to actually add the sync.
     auto completion = [=](error e) {
-        LOG_debug << "Starting to add sync: "
-                  << e;
-
-        // Make sure our caller completed successfully.
-        EXPECT_EQ(e, API_OK);
-
-        if (e != API_OK)
-            return result->set_value(UNDEF);
-
         // Convenience.
         constexpr auto BACKUP = SyncConfig::TYPE_BACKUP;
         constexpr auto TWOWAY = SyncConfig::TYPE_TWOWAY;
 
         // Generate config for the new sync.
         auto config =
-          SyncConfig(LocalPath::fromAbsolutePath(rootPath_.u8string()),
-                     rootPath_.u8string(),
+          SyncConfig(LocalPath::fromAbsolutePath(rootPath.u8string()),
+                     rootPath.u8string(),
                      remoteHandle,
                      remotePath,
                      0,
@@ -2211,61 +1968,86 @@ void StandardClient::setupSync_inThread(const string& drivePath,
             << "config.mOriginalPathOfRemoteRootNode: "
             << remotePath;
 
-        // Are we dealing with an external backup sync?
-        if (!drivePath_.empty())
-        {
-            // Then make sure we specify where the external drive can be found.
-            config.mExternalDrivePath =
-              LocalPath::fromAbsolutePath(drivePath_.u8string());
-        }
-
         //if (gScanOnly)
         //{
         //    config.mChangeDetectionMethod = CDM_PERIODIC_SCANNING;
         //    config.mScanIntervalSec = SCAN_INTERVAL_SEC;
         //}
 
-        auto completion = [result](error e, SyncError se, handle id) {
-            EXPECT_EQ(e, API_OK);
-            EXPECT_NE(id, UNDEF);
-            EXPECT_EQ(se, NO_SYNC_ERROR);
-
+        auto completion = [result](error, SyncError, handle id) {
             result->set_value(id);
         };
 
-        LOG_debug << "Asking engine to add the sync...";
-
-        auto result = client.addsync(config, true, std::move(completion), rootPath + " ");
-        EXPECT_EQ(result, API_OK);
+        client.addsync(config, true, std::move(completion), localPath + " ");
     };
 
     // Do we need to upload an ignore file?
-#if 0
-    if (uploadIgnoreFile)
-    {
-        auto ignorePath = fsBasePath / ".megaignore";
+    //if (uploadIgnoreFile)
+    //{
+    //    auto ignorePath = fsBasePath / ".megaignore";
 
-        // Create the ignore file.
-        auto created = createDataFile(ignorePath, "#");
-        EXPECT_TRUE(created);
+    //    // Create the ignore file.
+    //    if (!createDataFile(ignorePath, "#"))
+    //        return result->set_value(UNDEF);
 
-        if (!created)
-            return result->set_value(UNDEF);
+    //    // Upload the ignore file.
+    //    uploadFile(ignorePath, remoteNode, std::move(completion));
 
-        LOG_debug << "Uploading initial megaignore file...";
-
-        // Upload the ignore file.
-        uploadFile(ignorePath, remoteNode, std::move(completion));
-
-        // Completion function will continue the work.
-        return;
-    }
-#endif
-
-    LOG_debug << "Making sure we've received latest cloud changes...";
+    //    // Completion function will continue the work.
+    //    return;
+    //}
 
     // Make sure the client's received all its action packets.
     catchup(std::move(completion));
+}
+
+handle StandardClient::setupSync_mainthread(const string& localPath,
+                                            const string& remotePath,
+                                            const bool isBackup,
+                                            const bool uploadIgnoreFile)
+{
+    auto result = thread_do<handle>([&](StandardClient& client, PromiseHandleSP result) {
+        auto* root = client.gettestbasenode();
+        auto* node = client.drillchildnodebyname(root, remotePath);
+
+        if (!node)
+            return result->set_value(UNDEF);
+
+        client.setupSync_inThread(localPath,
+                                  *node,
+                                  isBackup,
+                                  uploadIgnoreFile,
+                                  std::move(result));
+    });
+
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
+        return UNDEF;
+
+    return result.get();
+}
+
+handle StandardClient::setupSync_mainthread(const string& localPath,
+                                            const handle remoteHandle,
+                                            const bool isBackup,
+                                            const bool uploadIgnoreFile)
+{
+    auto result = thread_do<handle>([&](StandardClient& client, PromiseHandleSP result) {
+        auto* node = client.client.nodebyhandle(remoteHandle);
+
+        if (!node)
+            return result->set_value(UNDEF);
+
+        client.setupSync_inThread(localPath,
+                                  *node,
+                                  isBackup,
+                                  uploadIgnoreFile,
+                                  std::move(result));
+    });
+
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
+        return UNDEF;
+
+    return result.get();
 }
 
 void StandardClient::importSyncConfigs(string configs, PromiseBoolSP result)
@@ -2280,7 +2062,7 @@ bool StandardClient::importSyncConfigs(string configs)
         thread_do<bool>([=](StandardClient& client, PromiseBoolSP result)
                         {
                             client.importSyncConfigs(configs, result);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
@@ -2292,7 +2074,7 @@ string StandardClient::exportSyncConfigs()
                         {
                             auto configs = client.syncs.exportSyncConfigs();
                             result->set_value(configs);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
@@ -2708,7 +2490,7 @@ bool StandardClient::enableSyncByBackupId(handle id, const string& logname)
         thread_do<bool>([=](StandardClient& client, PromiseBoolSP result)
                         {
                             client.enableSyncByBackupId(id, result, logname);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
@@ -2736,7 +2518,7 @@ handle StandardClient::backupIdForSyncPath(fs::path path)
         thread_do<handle>([=](StandardClient& client, PromiseHandleSP result)
                         {
                             client.backupIdForSyncPath(path, result);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
@@ -2748,7 +2530,7 @@ bool StandardClient::confirmModel_mainthread(handle id, Model::ModelNode* mRoot,
         [=](StandardClient& client, PromiseBoolSP result)
         {
             result->set_value(client.confirmModel(id, mRoot, rRoot, expectFail, skipIgnoreFile));
-        }, __FILE__, __LINE__);
+        });
 
     return result.get();
 }
@@ -2760,7 +2542,7 @@ bool StandardClient::confirmModel_mainthread(handle id, Model::ModelNode* mRoot,
         [=](StandardClient& client, PromiseBoolSP result)
         {
             result->set_value(client.confirmModel(id, mRoot, lRoot, expectFail, skipIgnoreFile));
-        }, __FILE__, __LINE__);
+        });
 
     return result.get();
 }
@@ -2772,7 +2554,7 @@ bool StandardClient::confirmModel_mainthread(handle id, Model::ModelNode* mRoot,
         [=](StandardClient& client, PromiseBoolSP result)
         {
             result->set_value(client.confirmModel(id, mRoot, lRoot, ignoreDebris, expectFail, skipIgnoreFile));
-        }, __FILE__, __LINE__);
+        });
 
     return result.get();
 }
@@ -2881,41 +2663,40 @@ void StandardClient::fetchnodes_result(const Error& e)
     resultproc.processresult(FETCHNODES, e, UNDEF);
 }
 
-bool StandardClient::setattr(const CloudItem& item, attr_map&& updates)
+bool StandardClient::setattr(Node* node, attr_map&& updates)
 {
     auto result =
-        thread_do<bool>([=](StandardClient& client, PromiseBoolSP result) mutable
+        thread_do<bool>(
+        [=](StandardClient& client, PromiseBoolSP result) mutable
         {
-            client.setattr(std::move(item), std::move(updates), result);
-        }, __FILE__, __LINE__);
-
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
+            client.setattr(node, std::move(updates), result);
+        });
 
     return result.get();
 }
 
-void StandardClient::setattr(const CloudItem& item, attr_map&& updates, PromiseBoolSP result)
+void StandardClient::setattr(Node* node, attr_map&& updates, PromiseBoolSP result)
 {
     resultproc.prepresult(COMPLETION,
                             ++next_request_tag,
                             [=]()
                             {
-                                auto* node = item.resolve(*this);
-                                if (!node)
-                                    return result->set_value(false);
-
                                 client.setattr(node, attr_map(updates), client.reqtag, nullptr,
                                     [result](NodeHandle, error e) { result->set_value(!e); });
                             }, nullptr);
 }
 
-bool StandardClient::rename(const CloudItem& item, const string& newName)
+bool StandardClient::rename(const string& path, const string& newName)
 {
-    return setattr(item, attr_map('n', newName));
+    // Locate the node corresponding to the specified path.
+    auto* node = drillchildnodebyname(gettestbasenode(), path);
+
+    // Can't rename a node that doesn't exist.
+    if (!node)
+        return false;
+
+    // Rename the node.
+    return setattr(node, attr_map('n', newName));
 }
 
 void StandardClient::unlink_result(handle h, error e)
@@ -2952,35 +2733,50 @@ bool StandardClient::disableSync(handle id, SyncError error, bool enabled)
         thread_do<bool>([=](StandardClient& client, PromiseBoolSP result)
                         {
                             client.disableSync(id, error, enabled, result);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
 
-void StandardClient::deleteremote(const CloudItem& item, PromiseBoolSP result)
-{
-    auto* node = item.resolve(*this);
-    if (!node)
-        return result->set_value(false);
 
-    client.unlink(node, false, 0, [result](NodeHandle, Error e) {
-        result->set_value(e == API_OK);
+void StandardClient::deleteremote(string path, bool fromroot, PromiseBoolSP pb)
+{
+    if (fromroot && !path.empty() && path[0] == '/') path.erase(0, 1);
+    if (Node* n = drillchildnodebyname(fromroot ? getcloudrootnode() : gettestbasenode(), path))
+    {
+        auto completion = [pb](NodeHandle, Error e) {
+            if (e) LOG_debug << "deleteremote received failure code from unlink: " << e;
+            pb->set_value(!e);
+        };
+
+        resultproc.prepresult(COMPLETION, ++next_request_tag,
+            [&](){ client.unlink(n, false, 0, std::move(completion)); },
+            nullptr);
+    }
+    else
+    {
+        LOG_debug << "Node not found for deleteremote, at path " << path << " (fromroot: " << fromroot << ")";
+        pb->set_value(false);
+    }
+}
+
+bool StandardClient::deleteremote(string path, bool fromroot)
+{
+    return withWait<bool>([&](PromiseBoolSP result) {
+        deleteremote(path, fromroot, std::move(result));
     });
 }
 
-bool StandardClient::deleteremote(const CloudItem& item)
+bool StandardClient::deleteremote(Node* node)
 {
-    auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
-        client.deleteremote(item, std::move(result));
-    }, __FILE__, __LINE__);
+    return withWait<bool>([=](PromiseBoolSP result) {
+        deleteremote(node, std::move(result));
+    });
+}
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
-
-    return result.get();
+void StandardClient::deleteremote(Node* node, PromiseBoolSP result)
+{
+    deleteremotenodes({node}, std::move(result));
 }
 
 bool StandardClient::deleteremotedebris()
@@ -3000,6 +2796,13 @@ void StandardClient::deleteremotedebris(PromiseBoolSP result)
     {
         result->set_value(true);
     }
+}
+
+bool StandardClient::deleteremotenode(Node* node)
+{
+    return withWait<bool>([&](PromiseBoolSP result) {
+        deleteremotenodes({node}, std::move(result));
+    });
 }
 
 void StandardClient::deleteremotenodes(vector<Node*> ns, PromiseBoolSP pb)
@@ -3023,46 +2826,63 @@ void StandardClient::deleteremotenodes(vector<Node*> ns, PromiseBoolSP pb)
     }
 }
 
-bool StandardClient::movenode(const CloudItem& source,
-                              const CloudItem& target,
-                              const string& newName)
+bool StandardClient::movenode(string path, string newParentPath)
 {
-    auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
-        client.movenode(source, target, newName, std::move(result));
-    }, __FILE__, __LINE__);
+    auto promise = makeSharedPromise<bool>();
+    auto future = promise->get_future();
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
+    movenode(std::move(path),
+                std::move(newParentPath),
+                std::move(promise));
 
-    if (status == future_status::timeout)
-        return false;
+    auto status = future.wait_for(DEFAULTWAIT);
 
-    return result.get();
+    return status == future_status::ready && future.get();
 }
 
-void StandardClient::movenode(const CloudItem& source,
-                              const CloudItem& target,
-                              const string& newName,
-                              PromiseBoolSP result)
+void StandardClient::movenode(string path, string newparentpath, PromiseBoolSP pb)
 {
-    auto* sourceNode = source.resolve(*this);
-    if (!sourceNode)
-        return result->set_value(false);
+    Node* n = drillchildnodebyname(gettestbasenode(), path);
+    Node* p = drillchildnodebyname(gettestbasenode(), newparentpath);
+    if (n && p)
+    {
+        resultproc.prepresult(COMPLETION, ++next_request_tag,
+            [pb, n, p, this]()
+            {
+                client.rename(n, p, SYNCDEL_NONE, NodeHandle(), nullptr,
+                    [pb](NodeHandle h, Error e) { pb->set_value(!e); });
+            },
+            nullptr);
+        return;
+    }
+    out() << "node or new parent not found";
+    pb->set_value(false);
+}
 
-    auto* targetNode = target.resolve(*this);
-    if (!targetNode)
-        return result->set_value(false);
+void StandardClient::movenode(handle h1, handle h2, PromiseBoolSP pb)
+{
+    Node* n = client.nodebyhandle(h1);
+    Node* p = client.nodebyhandle(h2);
+    if (n && p)
+    {
+        resultproc.prepresult(COMPLETION, ++next_request_tag,
+            [pb, n, p, this]()
+            {
+                client.rename(n, p, SYNCDEL_NONE, NodeHandle(), nullptr,
+                    [pb](NodeHandle h, Error e) { pb->set_value(!e); });
+            },
+            nullptr);
+        return;
+    }
+    out() << "node or new parent not found by handle";
+    pb->set_value(false);
+}
 
-    auto completion = [result](NodeHandle, Error e) {
-        result->set_value(e == API_OK);
-    };
-
-    client.rename(sourceNode,
-                  targetNode,
-                  SYNCDEL_NONE,
-                  NodeHandle(),
-                  newName.empty() ? nullptr : newName.c_str(),
-                  std::move(completion));
+bool StandardClient::movenode(handle h1, handle h2)
+{
+    return withWait([=](PromiseBoolSP result) {
+        movenode(h1, h2, std::move(result));
+    }, false);
 }
 
 void StandardClient::movenodetotrash(string path, PromiseBoolSP pb)
@@ -3131,7 +2951,7 @@ void StandardClient::waitonsyncs(chrono::seconds d)
                 any_add_del = true;
             }
             pb->set_value(true);
-        }, __FILE__, __LINE__).get();
+        }).get();
         bool allactive = true;
         {
             lock_guard<mutex> g(StandardClient::om);
@@ -3161,29 +2981,24 @@ void StandardClient::waitonsyncs(chrono::seconds d)
 
 bool StandardClient::login_reset(const string& user, const string& pw, bool noCache, bool resetBaseCloudFolder)
 {
-    received_user_alerts = false;
-
     future<bool> p1;
-    p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.preloginFromEnv(user, pb); }, __FILE__, __LINE__);
+    p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.preloginFromEnv(user, pb); });
     if (!waitonresults(&p1))
     {
         out() << "preloginFromEnv failed";
         return false;
     }
-    p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromEnv(user, pw, pb); }, __FILE__, __LINE__);
+    p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromEnv(user, pw, pb); });
     if (!waitonresults(&p1))
     {
         out() << "loginFromEnv failed";
         return false;
     }
-    p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.fetchnodes(noCache, pb); }, __FILE__, __LINE__);
+    p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.fetchnodes(noCache, pb); });
     if (!waitonresults(&p1)) {
         out() << "fetchnodes failed";
         return false;
     }
-
-    EXPECT_TRUE(waitForUserAlertsUpdated(30));
-
     if (resetBaseCloudFolder)
     {
         if (deleteTestBaseFolder(true) == 0)
@@ -3192,205 +3007,13 @@ bool StandardClient::login_reset(const string& user, const string& pw, bool noCa
             return false;
         }
 
-        p1 = thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(true, pb); }, __FILE__, __LINE__);
+        p1 = thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(true, pb); });
         if (!waitonresults(&p1)) {
             out() << "ensureTestBaseFolder failed";
             return false;
         }
     }
     return true;
-}
-
-bool StandardClient::resetBaseFolderMulticlient(StandardClient* c2, StandardClient* c3, StandardClient* c4)
-{
-    auto resetActionPacketFlags = [this, c2, c3, c4]() {
-        received_node_actionpackets = false;
-        if (c2) c2->received_node_actionpackets = false;
-        if (c3) c3->received_node_actionpackets = false;
-        if (c4) c4->received_node_actionpackets = false;
-    };
-
-    auto waitForActionPackets = [this, c2, c3, c4]() {
-        if (!waitForNodesUpdated(30))
-            return false;
-
-        if (c2 && !c2->waitForNodesUpdated(30))
-            return false;
-
-        if (c3 && !c3->waitForNodesUpdated(30))
-            return false;
-
-        if (c4 && !c4->waitForNodesUpdated(30))
-            return false;
-
-        return true;
-    };
-
-    resetActionPacketFlags();
-
-    switch (deleteTestBaseFolder(true))
-    {
-    case 0:
-        out() << "deleteTestBaseFolder failed";
-        return false;
-    case 2:
-        if (!waitForActionPackets())
-        {
-            out() << "No actionpacket received in at least one client for base folder deletion.";
-            return false;
-        }
-        break;
-    default:
-        break;
-    }
-
-    resetActionPacketFlags();
-
-    auto p1 = thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(true, pb); }, __FILE__, __LINE__);
-    if (!waitonresults(&p1)) {
-        out() << "ensureTestBaseFolder failed";
-        return false;
-    }
-
-    if (!waitForActionPackets())
-    {
-        out() << "No actionpacket received in at least one client for base folder creation";
-        return false;
-    }
-
-    auto checkOtherClient = [this](StandardClient* c, bool finalcheck) {
-        if (c)
-        {
-            auto p1 = c->thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(false, pb); }, __FILE__, __LINE__);
-            if (!waitonresults(&p1)) {
-                if (finalcheck) { out() << "ensureTestBaseFolder c2 failed"; }
-                return false;
-            }
-            if (c->basefolderhandle != basefolderhandle)
-            {
-                if (finalcheck) { out() << "base folder handle mismatch with c2"; }
-                return false;
-            }
-        }
-        return true;
-    };
-
-    // although we waited for actionpackets, it's possible that wait was satisfied by some late actionpacket from a prior test.
-    // wait a bit longer if it's not there already
-    for (int i = 60; i--; )
-    {
-        if (checkOtherClient(c2, false) &&
-            checkOtherClient(c3, false) &&
-            checkOtherClient(c4, false))
-            return true;
-        WaitMillisec(1000);
-    }
-
-    if (!checkOtherClient(c2, true)) return false;
-    if (!checkOtherClient(c3, true)) return false;
-    if (!checkOtherClient(c4, true)) return false;
-    return true;
-}
-
-void StandardClient::cleanupForTestReuse(int loginIndex)
-{
-
-    if (client.nodeByPath("/abort_jenkins_test_run"))
-    {
-        string user = getenv(envVarAccount[loginIndex].c_str());
-        cout << "Detected node /abort_jenkins_test_run in account " << user << ", aborting test run" << endl;
-        out() << "Detected node /abort_jenkins_test_run in account " << user << ", aborting test run";
-        WaitMillisec(100);
-        exit(1);
-    }
-
-    LOG_debug << clientname << "cleaning syncs for client reuse";
-    future<bool> p1;
-    p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) {
-
-        // currently synchronous
-        sc.client.syncs.removeSelectedSyncs(
-            [](SyncConfig&, Sync*){ return true; }
-            );
-
-        pb->set_value(true);
-    }, __FILE__, __LINE__);
-    if (!waitonresults(&p1))
-    {
-        out() << "removeSelectedSyncs failed";
-    }
-
-    // Remove any established anomaly reporter.
-    // TODO: Might need some kind of synchronization?
-    client.mFilenameAnomalyReporter = nullptr;
-
-
-    LOG_debug << clientname << "cleaning transfers for client reuse";
-
-    future<bool> p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) {
-
-        CancelToken cancelled(true);
-        int direction[] = { PUT, GET };
-        for (int d = 0; d < 2; ++d)
-        {
-            for (auto& it : sc.client.transfers[direction[d]])
-            {
-                for (auto& it2 : it.second->files)
-                {
-                    if (!it2->syncxfer)
-                    {
-                        it2->cancelToken = cancelled;
-                    }
-                }
-            }
-        }
-
-        pb->set_value(true);
-    }, __FILE__, __LINE__);
-    if (!waitonresults(&p2))
-    {
-        out() << "transfer removal failed";
-    }
-
-    // wait for completion of ongoing transfers, up to 60s
-    for (int i = 30000; i-- && !client.transfers[GET].empty(); ) WaitMillisec(1);
-    for (int i = 30000; i-- && !client.transfers[PUT].empty(); ) WaitMillisec(1);
-    LOG_debug << clientname << "transfers cleaned";
-
-    // wait further for reqs to finish if any are queued, up to 30s
-    for (int i = 30000; i-- && !client.transfers[PUT].empty(); ) WaitMillisec(1);
-
-    // check transfers were canceled successfully
-    if (client.transfers[PUT].size() || client.transfers[GET].size())
-    {
-        LOG_err << clientname << "Failed to clean transfers at cleanupForTestReuse():"
-                   << " put: " << client.transfers[PUT].size()
-                   << " get: " << client.transfers[GET].size();
-    }
-    else
-    {
-        LOG_debug << clientname << "transfers cleaned successfully";
-    }
-
-    // wait for cmds in flight and queued, up to 120s
-    if (client.reqs.cmdsinflight() || client.reqs.cmdspending())
-    {
-        LOG_debug << clientname << "waiting for requests to finish";
-        for (int i = 120000; i-- && (client.reqs.cmdspending() || client.reqs.cmdsinflight()); ) WaitMillisec(1);
-    }
-
-    // check any pending command was completed
-    if (client.reqs.cmdsinflight() || client.reqs.cmdspending())
-    {
-        LOG_err << clientname << "Failed to clean pending commands at cleanupForTestReuse():"
-                << " pending: " << client.reqs.cmdspending()
-                << " inflight: " << client.reqs.cmdsinflight();
-    }
-    else
-    {
-        LOG_debug << clientname << "requests cleaned successfully";
-    }
-
 }
 
 bool StandardClient::login_reset_makeremotenodes(const string& prefix, int depth, int fanout, bool noCache)
@@ -3405,7 +3028,7 @@ bool StandardClient::login_reset_makeremotenodes(const string& user, const strin
         out() << "login_reset failed";
         return false;
     }
-    future<bool> p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.makeCloudSubdirs(prefix, depth, fanout, pb); }, __FILE__, __LINE__);
+    future<bool> p1 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.makeCloudSubdirs(prefix, depth, fanout, pb); });
     if (!waitonresults(&p1))
     {
         out() << "makeCloudSubdirs failed";
@@ -3426,7 +3049,7 @@ bool StandardClient::ensureSyncUserAttributes()
         thread_do<bool>([](StandardClient& client, PromiseBoolSP result)
                         {
                             client.ensureSyncUserAttributes(result);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
@@ -3448,7 +3071,7 @@ handle StandardClient::copySyncConfig(const SyncConfig& config)
         thread_do<handle>([=](StandardClient& client, PromiseHandleSP result)
                         {
                             client.copySyncConfig(config, result);
-                        }, __FILE__, __LINE__);
+                        });
 
     return result.get();
 }
@@ -3456,51 +3079,41 @@ handle StandardClient::copySyncConfig(const SyncConfig& config)
 bool StandardClient::login(const string& user, const string& pw)
 {
     future<bool> p;
-    p = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.preloginFromEnv(user, pb); }, __FILE__, __LINE__);
+    p = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.preloginFromEnv(user, pb); });
     if (!waitonresults(&p)) return false;
-    p = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromEnv(user, pw, pb); }, __FILE__, __LINE__);
+    p = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromEnv(user, pw, pb); });
     return waitonresults(&p);
 }
 
 bool StandardClient::login_fetchnodes(const string& user, const string& pw, bool makeBaseFolder, bool noCache)
 {
-    received_user_alerts = false;
-
     future<bool> p2;
-    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.preloginFromEnv(user, pb); }, __FILE__, __LINE__);
+    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.preloginFromEnv(user, pb); });
     if (!waitonresults(&p2)) return false;
-    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromEnv(user, pw, pb); }, __FILE__, __LINE__);
+    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromEnv(user, pw, pb); });
     if (!waitonresults(&p2)) return false;
-    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.fetchnodes(noCache, pb); }, __FILE__, __LINE__);
+    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.fetchnodes(noCache, pb); });
     if (!waitonresults(&p2)) return false;
-
-    EXPECT_TRUE(waitForUserAlertsUpdated(30));
-
-    p2 = thread_do<bool>([makeBaseFolder](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(makeBaseFolder, pb); }, __FILE__, __LINE__);
+    p2 = thread_do<bool>([makeBaseFolder](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(makeBaseFolder, pb); });
     if (!waitonresults(&p2)) return false;
     return true;
 }
 
 bool StandardClient::login_fetchnodes(const string& session)
 {
-    received_user_alerts = false;
-
     future<bool> p2;
-    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromSession(session, pb); }, __FILE__, __LINE__);
+    p2 = thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.loginFromSession(session, pb); });
     if (!waitonresults(&p2)) return false;
-    p2 = thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.fetchnodes(false, pb); }, __FILE__, __LINE__);
+    p2 = thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.fetchnodes(false, pb); });
     if (!waitonresults(&p2)) return false;
-
-    EXPECT_TRUE(waitForUserAlertsUpdated(30));
-
-    p2 = thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(false, pb); }, __FILE__, __LINE__);
+    p2 = thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.ensureTestBaseFolder(false, pb); });
     if (!waitonresults(&p2)) return false;
     return true;
 }
 
 bool StandardClient::delSync_mainthread(handle backupId)
 {
-    future<bool> fb = thread_do<bool>([=](StandardClient& mc, PromiseBoolSP pb) { pb->set_value(mc.delSync_inthread(backupId)); }, __FILE__, __LINE__);
+    future<bool> fb = thread_do<bool>([=](StandardClient& mc, PromiseBoolSP pb) { pb->set_value(mc.delSync_inthread(backupId)); });
     return fb.get();
 }
 
@@ -3508,7 +3121,7 @@ bool StandardClient::confirmModel_mainthread(Model::ModelNode* mnode, handle bac
 {
     return thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) {
         pb->set_value(sc.confirmModel(backupId, mnode, confirm, ignoreDebris, expectFail, skipIgnoreFile));
-    }, __FILE__, __LINE__).get();
+    }).get();
 }
 
 bool StandardClient::match(handle id, const Model::ModelNode* source)
@@ -3517,14 +3130,7 @@ bool StandardClient::match(handle id, const Model::ModelNode* source)
 
     auto result = thread_do<bool>([=](StandardClient& client, PromiseBoolSP result) {
         client.match(id, source, std::move(result));
-    }, __FILE__, __LINE__);
-
-    auto status = result.wait_for(DEFAULTWAIT);
-
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
+    });
 
     return result.get();
 }
@@ -3533,15 +3139,13 @@ void StandardClient::match(handle id, const Model::ModelNode* source, PromiseBoo
 {
     SyncInfo info;
 
-    auto found = syncSet(id, info);
-    EXPECT_TRUE(found);
-
-    if (!found)
-        return result->set_value(false);
+    if (!syncSet(id, info))
+    {
+        result->set_value(false);
+        return;
+    }
 
     const auto* destination = client.nodeByHandle(info.h);
-    EXPECT_TRUE(destination);
-
     result->set_value(destination && match(*destination, *source));
 }
 
@@ -3549,12 +3153,9 @@ bool StandardClient::match(NodeHandle handle, const Model::ModelNode* source)
 {
     auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
         client.match(handle, source, std::move(result));
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return false;
 
     return result.get();
@@ -3562,17 +3163,15 @@ bool StandardClient::match(NodeHandle handle, const Model::ModelNode* source)
 
 void StandardClient::match(NodeHandle handle, const Model::ModelNode* source, PromiseBoolSP result)
 {
-    EXPECT_TRUE(source);
     if (!source)
         return result->set_value(false);
 
     auto node = client.nodeByHandle(handle);
-    EXPECT_TRUE(node);
 
     result->set_value(node && match(*node, *source));
 }
 
-bool StandardClient::waitFor(std::function<bool(StandardClient&)> predicate, const std::chrono::seconds &timeout)
+bool StandardClient::waitFor(std::function<bool(StandardClient&)>&& predicate, const std::chrono::seconds &timeout)
 {
     auto total = std::chrono::milliseconds(0);
     auto sleepIncrement = std::chrono::milliseconds(500);
@@ -3601,7 +3200,6 @@ bool StandardClient::waitFor(std::function<bool(StandardClient&)> predicate, con
 bool StandardClient::match(const Node& destination, const Model::ModelNode& source) const
 {
     list<pair<const Node*, decltype(&source)>> pending;
-    auto matched = true;
 
     pending.emplace_back(&destination, &source);
 
@@ -3611,94 +3209,27 @@ bool StandardClient::match(const Node& destination, const Model::ModelNode& sour
         const auto& sn = *pending.front().second;
 
         // Nodes must have matching types.
-        if (!sn.typematchesnodetype(dn.type))
-        {
-            LOG_debug << "Cloud model/type mismatch: "
-                      << dn.displaypath()
-                      << "("
-                      << dn.type
-                      << ")"
-                      << " vs. "
-                      << sn.path()
-                      << "("
-                      << sn.type
-                      << ")";
-
-            matched = false;
-            continue;
-        }
+        if (!sn.typematchesnodetype(dn.type)) return false;
 
         // Files require no further processing.
         if (dn.type == FILENODE) continue;
 
         map<string, decltype(&dn), CloudNameLess> dc;
         map<string, decltype(&sn), CloudNameLess> sc;
-        set<string, CloudNameLess> dd;
-        set<string, CloudNameLess> sd;
 
         // Index children for pairing.
         for (const auto* child : dn.children)
         {
-            string name = child->displayname();
-
-            // Duplicate already reported?
-            if (dd.count(name))
-            {
-                LOG_debug << "Cloud name conflict: "
-                          << child->displaypath();
-                continue;
-            }
-
             auto result = dc.emplace(child->displayname(), child);
 
-            // Didn't exist? No duplicate.
-            if (result.second)
-                continue;
-
-            LOG_debug << "Cloud name conflict: "
-                      << child->displaypath();
-
-            // Remmber the duplicate (name conflict.)
-            dc.erase(result.first);
-            dd.emplace(name);
-
-            matched = false;
+            // For simplicity, duplicates consistute a match failure.
+            if (!result.second) return false;
         }
 
         for (const auto& child : sn.kids)
         {
-            auto name = child->cloudName();
-
-            // Duplicate already reported?
-            if (dd.count(name))
-            {
-                LOG_debug << "Model node excluded due to cloud duplicates: "
-                          << child->path();
-                continue;
-            }
-
-            if (sd.count(name))
-            {
-                LOG_debug << "Model name conflict: "
-                          << child->path();
-                continue;
-            }
-
             auto result = sc.emplace(child->cloudName(), child.get());
-
-            // Didn't exist? No duplicate.
-            if (result.second)
-                continue;
-
-            LOG_debug << "Model name conflict: "
-                      << child->path();
-
-            // Remember the duplicate.
-            dc.erase(name);
-            sc.erase(result.first);
-            sd.emplace(name);
-
-            matched = false;
+            if (!result.second) return false;
         }
 
         // Pair children.
@@ -3716,15 +3247,8 @@ bool StandardClient::match(const Node& destination, const Model::ModelNode& sour
             // Does this node have a pair in the destination?
             auto d = dc.find(s.first);
 
-            matched &= d != dc.end();
-
             // If not then there can be no match.
-            if (d == dc.end())
-            {
-                LOG_debug << "Model node has no pair in cloud: "
-                          << s.second->path();
-                continue;
-            }
+            if (d == dc.end()) return false;
 
             // Queue pair for more detailed matching.
             pending.emplace_back(d->second, s.second);
@@ -3734,25 +3258,17 @@ bool StandardClient::match(const Node& destination, const Model::ModelNode& sour
         }
 
         // Can't have a match if we couldn't pair all destination nodes.
-        matched &= dc.empty();
-
-        // Log which nodes we couldn't match.
-        for (const auto& d : dc)
-        {
-            LOG_debug << "Cloud node has no pair in the model: "
-                      << d.second->displaypath();
-        }
-
+        if (!dc.empty()) return false;
     }
 
-    return matched;
+    return true;
 }
 
 bool StandardClient::backupOpenDrive(const fs::path& drivePath)
 {
     auto result = thread_do<bool>([=](StandardClient& client, PromiseBoolSP result) {
         client.backupOpenDrive(drivePath, std::move(result));
-    }, __FILE__, __LINE__);
+    });
 
     return result.get();
 }
@@ -3772,62 +3288,6 @@ void StandardClient::triggerPeriodicScanEarly(handle backupID)
     //client.syncs.triggerPeriodicScanEarly(backupID).get();
 }
 
-FileFingerprint StandardClient::fingerprint(const fs::path& fsPath)
-{
-    // Convenience.
-    auto& fsAccess = *client.fsaccess;
-
-    // Needed so we can access the filesystem.
-    auto fileAccess = fsAccess.newfileaccess(false);
-
-    // Translate input path into something useful.
-    auto path = LocalPath::fromAbsolutePath(fsPath.u8string());
-
-    FileFingerprint fingerprint;
-
-    // Try and open file for reading.
-    if (fileAccess->fopen(path, true, false))
-    {
-        // Generate fingerprint.
-        fingerprint.genfingerprint(fileAccess.get());
-    }
-
-    return fingerprint;
-}
-
-vector<FileFingerprint> StandardClient::fingerprints(const string& path)
-{
-    vector<FileFingerprint> results;
-
-    // Get our hands on the root node.
-    auto* root = gettestbasenode();
-
-    if (!root)
-        return results;
-
-    // Locate the specified node.
-    auto* node = drillchildnodebyname(root, path);
-
-    if (!node)
-        return results;
-
-    // Directories have no fingerprints.
-    if (node->type != FILENODE)
-        return results;
-
-    // Extract the fingerprints from the version chain.
-    results.emplace_back(*node);
-
-    while (!node->children.empty())
-    {
-        node = node->children.front();
-        results.emplace_back(*node);
-    }
-
-    // Pass fingerprints to caller.
-    return results;
-}
-
 void StandardClient::ipcr(handle id, ipcactions_t action, PromiseBoolSP result)
 {
     client.updatepcr(id, action, [=](error e, ipcactions_t) {
@@ -3839,12 +3299,9 @@ bool StandardClient::ipcr(handle id, ipcactions_t action)
 {
     auto result = thread_do<bool>([=](StandardClient& client, PromiseBoolSP result) {
         client.ipcr(id, action, std::move(result));
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return false;
 
     return result.get();
@@ -3857,12 +3314,9 @@ bool StandardClient::ipcr(handle id)
         auto j = client.client.pcrindex.end();
 
         result->set_value(i != j && !i->second->isoutgoing);
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return false;
 
     return result.get();
@@ -3886,13 +3340,10 @@ handle StandardClient::opcr(const string& email, opcactions_t action)
 {
     auto result = thread_do<handle>([&](StandardClient& client, PromiseHandleSP result) {
         client.opcr(email, action, std::move(result));
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
-        return false;
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
+        return UNDEF;
 
     return result.get();
 }
@@ -3907,12 +3358,9 @@ bool StandardClient::opcr(const string& email)
         }
 
         result->set_value(false);
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return false;
 
     return result.get();
@@ -3928,12 +3376,9 @@ bool StandardClient::iscontact(const string& email)
         }
 
         result->set_value(false);
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return false;
 
     return result.get();
@@ -3950,28 +3395,21 @@ bool StandardClient::rmcontact(const string& email)
 {
     auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
         client.rmcontact(email, std::move(result));
-    }, __FILE__, __LINE__);
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return false;
 
     return result.get();
 }
 
-void StandardClient::share(const CloudItem& item, const string& email, accesslevel_t permissions, PromiseBoolSP result)
+void StandardClient::share(Node& node, const string& email, accesslevel_t permissions, PromiseBoolSP result)
 {
-    auto* node = item.resolve(*this);
-    if (!node)
-        return result->set_value(false);
-
     auto completion = [=](Error e, bool) {
         result->set_value(!e);
     };
 
-    client.setshare(node,
+    client.setshare(&node,
                     email.c_str(),
                     permissions,
                     false,
@@ -3980,16 +3418,13 @@ void StandardClient::share(const CloudItem& item, const string& email, accesslev
                     std::move(completion));
 }
 
-bool StandardClient::share(const CloudItem& item, const string& email, accesslevel_t permissions)
+bool StandardClient::share(Node& node, const string& email, accesslevel_t permissions)
 {
     auto result = thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
-        client.share(item, email, permissions, std::move(result));
-    }, __FILE__, __LINE__);
+        client.share(node, email, permissions, std::move(result));
+    });
 
-    auto status = result.wait_for(DEFAULTWAIT);
-    EXPECT_NE(status, future_status::timeout);
-
-    if (status == future_status::timeout)
+    if (result.wait_for(DEFAULTWAIT) == future_status::timeout)
         return false;
 
     return result.get();
@@ -3998,43 +3433,40 @@ bool StandardClient::share(const CloudItem& item, const string& email, accesslev
 using SyncWaitPredicate = std::function<bool(StandardClient&)>;
 
 // Useful predicates.
-SyncWaitPredicate SyncDisabled(handle id)
-{
-    return [id](StandardClient& client) {
-        return client.syncByBackupId(id) == nullptr;
-    };
-}
-
-SyncWaitPredicate SyncMonitoring(handle id)
-{
-    return [id](StandardClient& client) {
-        const auto* sync = client.syncByBackupId(id);
-        return sync && sync->isBackupMonitoring();
-    };
-}
-
-SyncWaitPredicate SyncRemoteMatch(const CloudItem& item, const Model::ModelNode* source)
+SyncWaitPredicate SyncRemoteMatch(NodeHandle handle, const Model::ModelNode* source)
 {
     return [=](StandardClient& client) {
-        return client.thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
-            if (auto* node = item.resolve(client))
-                return client.match(node->nodeHandle(), source, std::move(result));
-            result->set_value(false);
-        }, __FILE__, __LINE__).get();
+        return client.match(handle, source);
     };
 }
 
-SyncWaitPredicate SyncRemoteMatch(const CloudItem& item, const Model& source)
+SyncWaitPredicate SyncRemoteMatch(const Node& node, const Model::ModelNode* source)
 {
-    return SyncRemoteMatch(item, source.root.get());
+    return SyncRemoteMatch(node.nodeHandle(), source);
 }
 
-SyncWaitPredicate SyncRemoteNodePresent(const CloudItem& item)
+SyncWaitPredicate SyncRemoteNodePresent(handle handle)
 {
-    return [item](StandardClient& client) {
+    return [handle](StandardClient& client) {
         return client.thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
-            result->set_value(item.resolve(client));
-        }, __FILE__, __LINE__).get();
+            result->set_value(client.client.nodebyhandle(handle));
+        }).get();
+    };
+}
+
+SyncWaitPredicate SyncRemoteNodePresent(const Node& node)
+{
+    return SyncRemoteNodePresent(node.nodehandle);
+}
+
+SyncWaitPredicate SyncRemoteNodePresent(const string& path)
+{
+    return [path](StandardClient& client) {
+        return client.thread_do<bool>([&](StandardClient& client, PromiseBoolSP result) {
+            auto root = client.gettestbasenode();
+            auto node = client.drillchildnodebyname(root, path);
+            result->set_value(!!node);
+        }).get();
     };
 }
 
@@ -4076,7 +3508,7 @@ void waitonsyncs(chrono::seconds d = std::chrono::seconds(4), StandardClient* c1
                         }
 
                         result->set_value(busy);
-                    }, __FILE__, __LINE__);
+                    });
 
                 any_add_del |= result.get();
             }
@@ -4263,16 +3695,6 @@ public:
         model0.root->addkid(model0.buildModelSubdirs("d", 2, 1, 0));
         model1.root->addkid(model1.buildModelSubdirs("d", 2, 1, 0));
 
-        // Make sure the client's agree on the cloud's state before proceeding.
-        {
-            auto* root = client0->gettestbasenode();
-            ASSERT_NE(root, nullptr);
-
-            auto predicate = SyncRemoteMatch(*root, model0.root.get());
-            ASSERT_TRUE(client0->waitFor(predicate, DEFAULTWAIT));
-            ASSERT_TRUE(client1->waitFor(predicate, DEFAULTWAIT));
-        }
-
         startSyncs();
         waitOnSyncs();
         confirmModels();
@@ -4310,24 +3732,12 @@ public:
         return client1->syncSet(backupId1).localpath;
     }
 
-    void prepareForNodeUpdates()
-    {
-        client0->received_node_actionpackets = false;
-        client1->received_node_actionpackets = false;
-    }
-
     void startSyncs()
     {
         backupId0 = client0->setupSync_mainthread("s0", "d", false, true);
         ASSERT_NE(backupId0, UNDEF);
         backupId1 = client1->setupSync_mainthread("s1", "d", false, false);
         ASSERT_NE(backupId1, UNDEF);
-    }
-
-    void waitForNodeUpdates()
-    {
-        ASSERT_TRUE(client0->waitForNodesUpdated(30));
-        ASSERT_TRUE(client1->waitForNodesUpdated(30));
     }
 
     void waitOnSyncs()
@@ -4352,11 +3762,7 @@ TEST_F(SyncFingerprintCollision, DifferentMacSameName)
     const auto path0 = localRoot0() / "d_0" / "a";
     const auto path1 = localRoot0() / "d_1" / "a";
 
-    prepareForNodeUpdates();
     ASSERT_TRUE(createDataFile(path0, data0));
-    waitForNodeUpdates();
-
-    // Wait for the engine to process any further changes.
     waitOnSyncs();
 
     // Alter MAC but leave fingerprint untouched.
@@ -4367,9 +3773,8 @@ TEST_F(SyncFingerprintCollision, DifferentMacSameName)
 
     ASSERT_TRUE(createDataFileWithTimestamp(client0->fsBasePath / "a", data1, stamp));
 
-    prepareForNodeUpdates();
+    // Move the file into place.
     fs::rename(client0->fsBasePath / "a", path1);
-    waitForNodeUpdates();
 
     // Wait for the engine to process changes.
     waitOnSyncs();
@@ -4390,11 +3795,7 @@ TEST_F(SyncFingerprintCollision, DifferentMacDifferentName)
     const auto path0 = localRoot0() / "d_0" / "a";
     const auto path1 = localRoot0() / "d_0" / "b";
 
-    prepareForNodeUpdates();
     ASSERT_TRUE(createDataFile(path0, data0));
-    waitForNodeUpdates();
-
-    // Process any further changes.
     waitOnSyncs();
 
     // Alter MAC but leave fingerprint untouched.
@@ -4405,9 +3806,8 @@ TEST_F(SyncFingerprintCollision, DifferentMacDifferentName)
 
     ASSERT_TRUE(createDataFileWithTimestamp(client0->fsBasePath / "a", data1, stamp));
 
-    prepareForNodeUpdates();
+    // Move the file into place.
     fs::rename(client0->fsBasePath / "a", path1);
-    waitForNodeUpdates();
 
     // Wait for the engine to process our change.
     waitOnSyncs();
@@ -4427,10 +3827,7 @@ TEST_F(SyncFingerprintCollision, SameMacDifferentName)
     const auto path0 = localRoot0() / "d_0" / "a";
     const auto path1 = localRoot0() / "d_0" / "b";
 
-    prepareForNodeUpdates();
     ASSERT_TRUE(createDataFile(path0, data0));
-    waitForNodeUpdates();
-
     waitOnSyncs();
 
     // Build the file somewhere the sync won't notice.
@@ -4439,9 +3836,7 @@ TEST_F(SyncFingerprintCollision, SameMacDifferentName)
     ASSERT_TRUE(createDataFileWithTimestamp(client0->fsBasePath / "b", data0, stamp));
 
     // Move file into place.
-    prepareForNodeUpdates();
     fs::rename(client0->fsBasePath / "b", path1);
-    waitForNodeUpdates();
 
     // Wait for the engine to process our changes.
     waitOnSyncs();
@@ -4480,70 +3875,71 @@ TEST_F(SyncTest, BasicSync_DelRemoteFolder)
 {
     // delete a remote folder and confirm the client sending the request and another also synced both correctly update the disk
     fs::path localtestroot = makeNewTestRoot();
-    auto clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    auto clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 3, 3));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
 
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
+
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 3, 3, 0));
 
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
     // delete something remotely and let sync catch up
-    clientA1->received_node_actionpackets = false;
-    clientA2->received_node_actionpackets = false;
+    clientA1.received_node_actionpackets = false;
+    clientA2.received_node_actionpackets = false;
 
-    ASSERT_TRUE(clientA1->deleteremote("f/f_2/f_2_1"));
+    ASSERT_TRUE(clientA1.deleteremote("f/f_2/f_2_1"));
 
-    ASSERT_TRUE(clientA1->waitForNodesUpdated(60));
-    ASSERT_TRUE(clientA2->waitForNodesUpdated(60));
+    ASSERT_TRUE(clientA1.waitForNodesUpdated(60));
+    ASSERT_TRUE(clientA2.waitForNodesUpdated(60));
 
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
+    waitonsyncs(std::chrono::seconds(60), &clientA1, &clientA2);
 
     // check everything matches in both syncs (model has expected state of remote and local)
     ASSERT_TRUE(model.movetosynctrash("f/f_2/f_2_1", "f"));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 }
 
 TEST_F(SyncTest, BasicSync_DelLocalFolder)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
-    auto clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    auto clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 3, 3));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
 
     // check everything matches (model has expected state of remote and local)
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 3, 3, 0));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
-    auto checkpath = clientA1->syncSet(backupId1).localpath.u8string();
+    auto checkpath = clientA1.syncSet(backupId1).localpath.u8string();
     out() << "checking paths " << checkpath;
     for(auto& p: fs::recursive_directory_iterator(TestFS::GetTestFolder()))
     {
@@ -4551,144 +3947,152 @@ TEST_F(SyncTest, BasicSync_DelLocalFolder)
     }
     // delete something in the local filesystem and see if we catch up in A1 and A2 (deleter and observer syncs)
     error_code e;
-    auto nRemoved = fs::remove_all(clientA1->syncSet(backupId1).localpath / "f_2" / "f_2_1", e);
-    ASSERT_TRUE(!e) << "remove failed " << (clientA1->syncSet(backupId1).localpath / "f_2" / "f_2_1").u8string() << " error " << e;
+    auto nRemoved = fs::remove_all(clientA1.syncSet(backupId1).localpath / "f_2" / "f_2_1", e);
+    ASSERT_TRUE(!e) << "remove failed " << (clientA1.syncSet(backupId1).localpath / "f_2" / "f_2_1").u8string() << " error " << e;
     ASSERT_GT(static_cast<unsigned int>(nRemoved), 0u) << e;
 
     // let them catch up
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
+    waitonsyncs(std::chrono::seconds(20), &clientA1, &clientA2);
 
     // check everything matches (model has expected state of remote and local)
     ASSERT_TRUE(model.movetosynctrash("f/f_2/f_2_1", "f"));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
     ASSERT_TRUE(model.removesynctrash("f"));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
 }
 
 TEST_F(SyncTest, BasicSync_MoveLocalFolderPlain)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
-    auto clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    auto clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 3, 3));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 3, 3, 0));
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
-    waitonsyncs(std::chrono::seconds(8), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
 
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
     out() << "----- making sync change to test, now -----";
-    clientA1->received_node_actionpackets = false;
-    clientA2->received_node_actionpackets = false;
+    clientA1.received_node_actionpackets = false;
+    clientA2.received_node_actionpackets = false;
 
     // move something in the local filesystem and see if we catch up in A1 and A2 (deleter and observer syncs)
     error_code rename_error;
-    fs::rename(clientA1->syncSet(backupId1).localpath / "f_2" / "f_2_1", clientA1->syncSet(backupId1).localpath / "f_2_1", rename_error);
+    fs::rename(clientA1.syncSet(backupId1).localpath / "f_2" / "f_2_1", clientA1.syncSet(backupId1).localpath / "f_2_1", rename_error);
     ASSERT_TRUE(!rename_error) << rename_error;
 
     // client1 should send a rename command to the API
     // both client1 and client2 should receive the corresponding actionpacket
-    ASSERT_TRUE(clientA1->waitForNodesUpdated(60)) << " no actionpacket received in clientA1 for rename";
-    ASSERT_TRUE(clientA2->waitForNodesUpdated(60)) << " no actionpacket received in clientA2 for rename";
-
+    const char* s = nullptr; // Maybe intended for an ASSERT ?
+    if (!clientA1.waitForNodesUpdated(60))
+    {
+        s = " no actionpacket received in clientA1 for rename";
+        out() << s;
+    }
+    if (!clientA2.waitForNodesUpdated(60))
+    {
+        s = " no actionpacket received in clientA2 for rename";
+        out() << s;
+    }
     out() << "----- wait for actionpackets ended -----";
 
     // sync activity should not take much longer after that.
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
 
     // check everything matches (model has expected state of remote and local)
     ASSERT_TRUE(model.movenode("f/f_2/f_2_1", "f"));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 }
 
 TEST_F(SyncTest, BasicSync_MoveLocalFolderBetweenSyncs)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
+    StandardClient clientA3(localtestroot, "clientA3");   // user 1 client 3
 
-    auto clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    auto clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    auto clientA3 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2, clientA3));
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 3, 3));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2, clientA3));
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_TRUE(clientA3.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     // set up sync for A1 and A2, it should build matching local folders
-    handle backupId11 = clientA1->setupSync_mainthread("sync1", "f/f_0", false, false);
+    handle backupId11 = clientA1.setupSync_mainthread("sync1", "f/f_0", false, false);
     ASSERT_NE(backupId11, UNDEF);
-    handle backupId12 = clientA1->setupSync_mainthread("sync2", "f/f_2", false, false);
+    handle backupId12 = clientA1.setupSync_mainthread("sync2", "f/f_2", false, false);
     ASSERT_NE(backupId12, UNDEF);
-    handle backupId21 = clientA2->setupSync_mainthread("syncA2_1", "f/f_0", false, false);
+    handle backupId21 = clientA2.setupSync_mainthread("syncA2_1", "f/f_0", false, false);
     ASSERT_NE(backupId21, UNDEF);
-    handle backupId22 = clientA2->setupSync_mainthread("syncA2_2", "f/f_2", false, false);
+    handle backupId22 = clientA2.setupSync_mainthread("syncA2_2", "f/f_2", false, false);
     ASSERT_NE(backupId22, UNDEF);
-    handle backupId31 = clientA3->setupSync_mainthread("syncA3", "f", false, false);
+    handle backupId31 = clientA3.setupSync_mainthread("syncA3", "f", false, false);
     ASSERT_NE(backupId31, UNDEF);
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2, clientA3);
-    clientA1->logcb = clientA2->logcb = clientA3->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2, &clientA3);
+    clientA1.logcb = clientA2.logcb = clientA3.logcb = true;
 
     // check everything matches (model has expected state of remote and local)
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 3, 3, 0));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f/f_0"), backupId11));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f/f_2"), backupId12));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f/f_0"), backupId21));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f/f_2"), backupId22));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f/f_0"), backupId11));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f/f_2"), backupId12));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f/f_0"), backupId21));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f/f_2"), backupId22));
 
     // the other model gets .debris folders added at other levels for easy comparisons
     Model cleanModel;
     cleanModel.root->addkid(cleanModel.buildModelSubdirs("f", 3, 3, 0));
-    ASSERT_TRUE(clientA3->confirmModel_mainthread(cleanModel.findnode("f"), backupId31));
+    ASSERT_TRUE(clientA3.confirmModel_mainthread(cleanModel.findnode("f"), backupId31));
 
     LOG_debug << "----- making sync change to test, now -----";
-    clientA1->received_node_actionpackets = false;
-    clientA2->received_node_actionpackets = false;
-    clientA3->received_node_actionpackets = false;
+    clientA1.received_node_actionpackets = false;
+    clientA2.received_node_actionpackets = false;
+    clientA3.received_node_actionpackets = false;
 
     // move a folder form one local synced folder to another local synced folder and see if we sync correctly and catch up in A2 and A3 (mover and observer syncs)
     error_code rename_error;
-    fs::path path1 = clientA1->syncSet(backupId11).localpath / "f_0_1";
-    fs::path path2 = clientA1->syncSet(backupId12).localpath / "f_2_1" / "f_2_1_0" / "f_0_1";
+    fs::path path1 = clientA1.syncSet(backupId11).localpath / "f_0_1";
+    fs::path path2 = clientA1.syncSet(backupId12).localpath / "f_2_1" / "f_2_1_0" / "f_0_1";
     fs::rename(path1, path2, rename_error);
     ASSERT_TRUE(!rename_error) << rename_error;
 
-    clientA1->triggerPeriodicScanEarly(backupId11);
-    clientA1->triggerPeriodicScanEarly(backupId12);
+    clientA1.triggerPeriodicScanEarly(backupId11);
+    clientA1.triggerPeriodicScanEarly(backupId12);
 
     // client1 should send a rename command to the API
     // both client1 and client2 should receive the corresponding actionpacket
-    ASSERT_TRUE(clientA1->waitForNodesUpdated(30)) << " no actionpacket received in clientA1 for rename";
-    ASSERT_TRUE(clientA2->waitForNodesUpdated(30)) << " no actionpacket received in clientA2 for rename";
-    ASSERT_TRUE(clientA3->waitForNodesUpdated(30)) << " no actionpacket received in clientA3 for rename";
+    ASSERT_TRUE(clientA1.waitForNodesUpdated(30)) << " no actionpacket received in clientA1 for rename";
+    ASSERT_TRUE(clientA2.waitForNodesUpdated(30)) << " no actionpacket received in clientA2 for rename";
+    ASSERT_TRUE(clientA3.waitForNodesUpdated(30)) << " no actionpacket received in clientA3 for rename";
 
     // let them catch up
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2, clientA3);
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2, &clientA3);
 
     // check everything matches (model has expected state of remote and local)
     ASSERT_TRUE(model.movenode("f/f_0/f_0_1", "f/f_2/f_2_1/f_2_1_0"));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f/f_0"), backupId11));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f/f_2"), backupId12));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f/f_0"), backupId21));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f/f_2"), backupId22));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f/f_0"), backupId11));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f/f_2"), backupId12));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f/f_0"), backupId21));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f/f_2"), backupId22));
 
     ASSERT_TRUE(cleanModel.movenode("f/f_0/f_0_1", "f/f_2/f_2_1/f_2_1_0"));
-    ASSERT_TRUE(clientA3->confirmModel_mainthread(cleanModel.findnode("f"), backupId31));
+    ASSERT_TRUE(clientA3.confirmModel_mainthread(cleanModel.findnode("f"), backupId31));
 }
 
 TEST_F(SyncTest, BasicSync_RenameLocalFile)
@@ -4697,37 +4101,36 @@ TEST_F(SyncTest, BasicSync_RenameLocalFile)
 
     const fs::path root = makeNewTestRoot();
 
-    auto client0 = g_clientManager->getCleanStandardClient(0, root); // user 1 client 1
-    auto client1 = g_clientManager->getCleanStandardClient(0, root); // user 1 client 2
-    ASSERT_TRUE(client0->resetBaseFolderMulticlient(client1));
-    ASSERT_TRUE(client0->makeCloudSubdirs("x", 0, 0));
-    ASSERT_TRUE(CatchupClients(client0, client1));
+    // Primary client.
+    StandardClient client0(root, "c0");
+    // Observer.
+    StandardClient client1(root, "c1");
 
     // Log callbacks.
-    client0->logcb = true;
-    client1->logcb = true;
+    client0.logcb = true;
+    client1.logcb = true;
 
     // Log clients in.
-    ///ASSERT_TRUE(client0.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "x", 0, 0));
-    ///ASSERT_TRUE(client1.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
-    ASSERT_EQ(client0->basefolderhandle, client1->basefolderhandle);
+    ASSERT_TRUE(client0.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "x", 0, 0));
+    ASSERT_TRUE(client1.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(client0.basefolderhandle, client1.basefolderhandle);
 
     // Set up syncs.
-    handle backupId0 = client0->setupSync_mainthread("s0", "x", false, true);
+    handle backupId0 = client0.setupSync_mainthread("s0", "x", false, true);
     ASSERT_NE(backupId0, UNDEF);
-    handle backupId1 = client1->setupSync_mainthread("s1", "x", false, false);
+    handle backupId1 = client1.setupSync_mainthread("s1", "x", false, false);
     ASSERT_NE(backupId1, UNDEF);
 
     // Wait for initial sync to complete.
-    waitonsyncs(TIMEOUT, client0, client1);
+    waitonsyncs(TIMEOUT, &client0, &client1);
 
     // Add x/f.
-    ASSERT_TRUE(createNameFile(client0->syncSet(backupId0).localpath, "f"));
+    ASSERT_TRUE(createNameFile(client0.syncSet(backupId0).localpath, "f"));
 
-    client0->triggerPeriodicScanEarly(backupId0);
+    client0.triggerPeriodicScanEarly(backupId0);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, client0, client1);
+    waitonsyncs(TIMEOUT, &client0, &client1);
 
     // Confirm model.
     Model model;
@@ -4735,65 +4138,65 @@ TEST_F(SyncTest, BasicSync_RenameLocalFile)
     model.root->addkid(model.makeModelSubfolder("x"));
     model.findnode("x")->addkid(model.makeModelSubfile("f"));
 
-    ASSERT_TRUE(client0->confirmModel_mainthread(model.findnode("x"), backupId0));
-    ASSERT_TRUE(client1->confirmModel_mainthread(model.findnode("x"), backupId1, true));
+    ASSERT_TRUE(client0.confirmModel_mainthread(model.findnode("x"), backupId0));
+    ASSERT_TRUE(client1.confirmModel_mainthread(model.findnode("x"), backupId1, true));
 
     // Rename x/f to x/g.
-    fs::rename(client0->syncSet(backupId0).localpath / "f",
-               client0->syncSet(backupId0).localpath / "g");
+    fs::rename(client0.syncSet(backupId0).localpath / "f",
+               client0.syncSet(backupId0).localpath / "g");
 
-    client0->triggerPeriodicScanEarly(backupId0);
+    client0.triggerPeriodicScanEarly(backupId0);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, client0, client1);
+    waitonsyncs(TIMEOUT, &client0, &client1);
 
     // Update and confirm model.
     model.findnode("x/f")->name = "g";
 
-    ASSERT_TRUE(client0->confirmModel_mainthread(model.findnode("x"), backupId0));
-    ASSERT_TRUE(client1->confirmModel_mainthread(model.findnode("x"), backupId1, true));
+    ASSERT_TRUE(client0.confirmModel_mainthread(model.findnode("x"), backupId0));
+    ASSERT_TRUE(client1.confirmModel_mainthread(model.findnode("x"), backupId1, true));
 }
 
 TEST_F(SyncTest, BasicSync_AddLocalFolder)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
-    StandardClientInUse clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    StandardClientInUse clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
-    ASSERT_TRUE(clientA2->makeCloudSubdirs("f", 3, 3));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    ASSERT_EQ(clientA1->basefolderhandle, clientA2->basefolderhandle);
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 3, 3, 0));
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
 
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
     // make new folders (and files) in the local filesystem and see if we catch up in A1 and A2 (adder and observer syncs)
-    ASSERT_TRUE(buildLocalFolders(clientA1->syncSet(backupId1).localpath / "f_2", "newkid", 2, 2, 2));
+    ASSERT_TRUE(buildLocalFolders(clientA1.syncSet(backupId1).localpath / "f_2", "newkid", 2, 2, 2));
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
     // let them catch up
-    waitonsyncs(std::chrono::seconds(30), clientA1, clientA2);  // two minutes should be long enough to get past API_ETEMPUNAVAIL == -18 for sync2 downloading the files uploaded by sync1
+    waitonsyncs(std::chrono::seconds(30), &clientA1, &clientA2);  // two minutes should be long enough to get past API_ETEMPUNAVAIL == -18 for sync2 downloading the files uploaded by sync1
 
     // check everything matches (model has expected state of remote and local)
     model.findnode("f/f_2")->addkid(model.buildModelSubdirs("newkid", 2, 2, 2));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
     model.ensureLocalDebrisTmpLock("f"); // since we downloaded files
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 }
+
 
 // todo: add this test once the sync can keep up with file system notifications - at the moment
 // it's too slow because we wait for the cloud before processing the next layer of files+folders.
@@ -4803,27 +4206,25 @@ TEST_F(SyncTest, BasicSync_MassNotifyFromLocalFolderTree)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
-    StandardClientInUse clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient());
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 0, 0));
-    ASSERT_TRUE(CatchupClients(clientA1));
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    //StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    //ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 0, 0));
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 0, 0));
     //ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
     //ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
     //ASSERT_TRUE(clientA2.setupSync_mainthread("sync2", "f", 2));
-    waitonsyncs(std::chrono::seconds(4), clientA1/*, &clientA2*/);
+    waitonsyncs(std::chrono::seconds(4), &clientA1/*, &clientA2*/);
     //clientA1.logcb = clientA2.logcb = true;
 
     // Create a directory tree in one sync, it should be synced to the cloud and back to the other
     // Create enough files and folders that we put a strain on the notification logic: 3k entries
-    ASSERT_TRUE(buildLocalFolders(clientA1->syncSet(backupId1).localpath, "initial", 0, 0, 16000));
+    ASSERT_TRUE(buildLocalFolders(clientA1.syncSet(backupId1).localpath, "initial", 0, 0, 16000));
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
     //waitonsyncs(std::chrono::seconds(10), &clientA1 /*, &clientA2*/);
     std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -4833,7 +4234,7 @@ TEST_F(SyncTest, BasicSync_MassNotifyFromLocalFolderTree)
     while (std::chrono::steady_clock::now() - startTime < std::chrono::seconds(5 * 60))
     {
         size_t remaining = 0;
-        auto result0 = clientA1->thread_do<bool>([&](StandardClient &sc, PromiseBoolSP p)
+        auto result0 = clientA1.thread_do<bool>([&](StandardClient &sc, PromiseBoolSP p)
         {
             sc.client.syncs.forEachRunningSync(
               [&](Sync* s)
@@ -4845,7 +4246,7 @@ TEST_F(SyncTest, BasicSync_MassNotifyFromLocalFolderTree)
               });
 
             p->set_value(true);
-        }, __FILE__, __LINE__);
+        });
         result0.get();
         if (!remaining) break;
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -4854,15 +4255,15 @@ TEST_F(SyncTest, BasicSync_MassNotifyFromLocalFolderTree)
     Model model;
     model.root->addkid(model.buildModelSubdirs("initial", 0, 0, 16000));
 
-    clientA1->waitFor([&](StandardClient&){ return clientA1->transfersAdded.load() > 0; }, std::chrono::seconds(60));  // give it a chance to create all the nodes.
+    clientA1.waitFor([&](StandardClient&){ return clientA1.transfersAdded.load() > 0; }, std::chrono::seconds(60));  // give it a chance to create all the nodes.
 
     // check everything matches (just local since it'll still be uploading files)
-    clientA1->localNodesMustHaveNodes = false;
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.root.get(), backupId1, false, StandardClient::CONFIRM_LOCAL));
+    clientA1.localNodesMustHaveNodes = false;
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.root.get(), backupId1, false, StandardClient::CONFIRM_LOCAL));
     //ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), 2));
 
-    ASSERT_GT(clientA1->transfersAdded.load(), 0u);
-    clientA1->transfersAdded = 0;
+    ASSERT_GT(clientA1.transfersAdded.load(), 0u);
+    clientA1.transfersAdded = 0;
 
     // rename all those files and folders, put a strain on the notify system again.
     // Also, no downloads (or uploads) should occur as a result of this.
@@ -4969,103 +4370,101 @@ TEST_F(SyncTest, BasicSync_MoveExistingIntoNewLocalFolder)
 {
     // historic case:  in the local filesystem, create a new folder then move an existing file/folder into it
     fs::path localtestroot = makeNewTestRoot();
-    StandardClientInUse clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    StandardClientInUse clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 3, 3));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    ASSERT_EQ(clientA1->basefolderhandle, clientA2->basefolderhandle);
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 3, 3, 0));
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
 
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
     // make new folder in the local filesystem
-    ASSERT_TRUE(buildLocalFolders(clientA1->syncSet(backupId1).localpath, "new", 1, 0, 0));
+    ASSERT_TRUE(buildLocalFolders(clientA1.syncSet(backupId1).localpath, "new", 1, 0, 0));
     // move an already synced folder into it
     error_code rename_error;
-    fs::path path1 = clientA1->syncSet(backupId1).localpath / "f_2"; // / "f_2_0" / "f_2_0_0";
-    fs::path path2 = clientA1->syncSet(backupId1).localpath / "new" / "f_2"; // "f_2_0_0";
+    fs::path path1 = clientA1.syncSet(backupId1).localpath / "f_2"; // / "f_2_0" / "f_2_0_0";
+    fs::path path2 = clientA1.syncSet(backupId1).localpath / "new" / "f_2"; // "f_2_0_0";
     fs::rename(path1, path2, rename_error);
     ASSERT_TRUE(!rename_error) << rename_error;
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
     // let them catch up
-    waitonsyncs(std::chrono::seconds(10), clientA1, clientA2);
+    waitonsyncs(std::chrono::seconds(10), &clientA1, &clientA2);
 
     // check everything matches (model has expected state of remote and local)
     auto f = model.makeModelSubfolder("new");
     f->addkid(model.removenode("f/f_2")); // / f_2_0 / f_2_0_0"));
     model.findnode("f")->addkid(move(f));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 }
 
 TEST_F(SyncTest, BasicSync_MoveSeveralExistingIntoDeepNewLocalFolders)
 {
     // historic case:  in the local filesystem, create a new folder then move an existing file/folder into it
     fs::path localtestroot = makeNewTestRoot();
-    StandardClientInUse clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    StandardClientInUse clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 1
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 3, 3));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    ASSERT_EQ(clientA1->basefolderhandle, clientA2->basefolderhandle);
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 3, 3, 0));
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
 
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
     // make new folder tree in the local filesystem
-    ASSERT_TRUE(buildLocalFolders(clientA1->syncSet(backupId1).localpath, "new", 3, 3, 3));
+    ASSERT_TRUE(buildLocalFolders(clientA1.syncSet(backupId1).localpath, "new", 3, 3, 3));
 
     // move already synced folders to serveral parts of it - one under another moved folder too
     error_code rename_error;
-    fs::rename(clientA1->syncSet(backupId1).localpath / "f_0", clientA1->syncSet(backupId1).localpath / "new" / "new_0" / "new_0_1" / "new_0_1_2" / "f_0", rename_error);
+    fs::rename(clientA1.syncSet(backupId1).localpath / "f_0", clientA1.syncSet(backupId1).localpath / "new" / "new_0" / "new_0_1" / "new_0_1_2" / "f_0", rename_error);
     ASSERT_TRUE(!rename_error) << rename_error;
-    fs::rename(clientA1->syncSet(backupId1).localpath / "f_1", clientA1->syncSet(backupId1).localpath / "new" / "new_1" / "new_1_2" / "f_1", rename_error);
+    fs::rename(clientA1.syncSet(backupId1).localpath / "f_1", clientA1.syncSet(backupId1).localpath / "new" / "new_1" / "new_1_2" / "f_1", rename_error);
     ASSERT_TRUE(!rename_error) << rename_error;
-    fs::rename(clientA1->syncSet(backupId1).localpath / "f_2", clientA1->syncSet(backupId1).localpath / "new" / "new_1" / "new_1_2" / "f_1" / "f_1_2" / "f_2", rename_error);
+    fs::rename(clientA1.syncSet(backupId1).localpath / "f_2", clientA1.syncSet(backupId1).localpath / "new" / "new_1" / "new_1_2" / "f_1" / "f_1_2" / "f_2", rename_error);
     ASSERT_TRUE(!rename_error) << rename_error;
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
     // let them catch up
-    waitonsyncs(std::chrono::seconds(30), clientA1, clientA2);
+    waitonsyncs(std::chrono::seconds(30), &clientA1, &clientA2);
 
     // check everything matches (model has expected state of remote and local)
     model.findnode("f")->addkid(model.buildModelSubdirs("new", 3, 3, 3));
     model.findnode("f/new/new_0/new_0_1/new_0_1_2")->addkid(model.removenode("f/f_0"));
     model.findnode("f/new/new_1/new_1_2")->addkid(model.removenode("f/f_1"));
     model.findnode("f/new/new_1/new_1_2/f_1/f_1_2")->addkid(model.removenode("f/f_2"));
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
     model.ensureLocalDebrisTmpLock("f"); // since we downloaded files
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 }
 
 /* not expected to work yet
@@ -5107,7 +4506,6 @@ TEST_F(SyncTest, BasicSync_RemoveLocalNodeBeforeSessionResume)
 {
     fs::path localtestroot = makeNewTestRoot();
     auto pclientA1 = ::mega::make_unique<StandardClient>(localtestroot, "clientA1");   // user 1 client 1
-    // don't use client manager as this client gets replaced
     StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
     ASSERT_TRUE(pclientA1->login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
@@ -5240,7 +4638,6 @@ TEST_F(SyncTest, BasicSync_ResumeSyncFromSessionAfterNonclashingLocalAndRemoteCh
 {
     fs::path localtestroot = makeNewTestRoot();
     unique_ptr<StandardClient> pclientA1(new StandardClient(localtestroot, "clientA1"));   // user 1 client 1
-    // don't use client manager as this client gets replaced
     StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
     ASSERT_TRUE(pclientA1->login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
@@ -5271,15 +4668,16 @@ TEST_F(SyncTest, BasicSync_ResumeSyncFromSessionAfterNonclashingLocalAndRemoteCh
     pclientA1->localLogout();
 
     out() << "*********************  add remote folders via A2";
-    future<bool> p1 = clientA2.thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.makeCloudSubdirs("newremote", 2, 2, pb, "f/f_1/f_1_0"); }, __FILE__, __LINE__);
+    future<bool> p1 = clientA2.thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.makeCloudSubdirs("newremote", 2, 2, pb, "f/f_1/f_1_0"); });
     model1.findnode("f/f_1/f_1_0")->addkid(model1.buildModelSubdirs("newremote", 2, 2, 0));
     model2.findnode("f/f_1/f_1_0")->addkid(model2.buildModelSubdirs("newremote", 2, 2, 0));
     ASSERT_TRUE(waitonresults(&p1));
 
     out() << "*********************  remove remote folders via A2";
-    ASSERT_TRUE(clientA2.deleteremote("f/f_0"));
+    p1 = clientA2.thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.deleteremote("f/f_0", false, pb); });
     model1.movetosynctrash("f/f_0", "f");
     model2.movetosynctrash("f/f_0", "f");
+    ASSERT_TRUE(waitonresults(&p1));
 
     out() << "*********************  add local folders in A1";
     ASSERT_TRUE(buildLocalFolders(sync1path / "f_1/f_1_2", "newlocal", 2, 2, 2));
@@ -5316,7 +4714,6 @@ TEST_F(SyncTest, BasicSync_ResumeSyncFromSessionAfterClashingLocalAddRemoteDelet
 {
     fs::path localtestroot = makeNewTestRoot();
     unique_ptr<StandardClient> pclientA1(new StandardClient(localtestroot, "clientA1"));   // user 1 client 1
-    // don't use client manager as this client gets replaced
     StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
     ASSERT_TRUE(pclientA1->login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
@@ -5347,7 +4744,8 @@ TEST_F(SyncTest, BasicSync_ResumeSyncFromSessionAfterClashingLocalAddRemoteDelet
     pclientA1->localLogout();
 
     // remove remote folder via A2
-    ASSERT_TRUE(clientA2.deleteremote("f/f_1"));
+    future<bool> p1 = clientA2.thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb) { sc.deleteremote("f/f_1", false, pb); });
+    ASSERT_TRUE(waitonresults(&p1));
 
     // add local folders in A1 on disk folder
     ASSERT_TRUE(buildLocalFolders(sync1path / "f_1/f_1_2", "newlocal", 2, 2, 2));
@@ -5392,7 +4790,6 @@ TEST_F(SyncTest, CmdChecks_RRAttributeAfterMoveNode)
 {
     fs::path localtestroot = makeNewTestRoot();
     unique_ptr<StandardClient> pclientA1(new StandardClient(localtestroot, "clientA1"));   // user 1 client 1
-    // don't use client manager as this client gets replaced
 
     ASSERT_TRUE(pclientA1->login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 3, 3));
 
@@ -5402,7 +4799,7 @@ TEST_F(SyncTest, CmdChecks_RRAttributeAfterMoveNode)
 
     // make sure there are no 'f' in the rubbish
     auto fv = pclientA1->drillchildnodesbyname(pclientA1->getcloudrubbishnode(), "f");
-    future<bool> fb = pclientA1->thread_do<bool>([&fv](StandardClient& sc, PromiseBoolSP pb) { sc.deleteremotenodes(fv, pb); }, __FILE__, __LINE__);
+    future<bool> fb = pclientA1->thread_do<bool>([&fv](StandardClient& sc, PromiseBoolSP pb) { sc.deleteremotenodes(fv, pb); });
     ASSERT_TRUE(waitonresults(&fb));
 
     f = pclientA1->drillchildnodebyname(pclientA1->getcloudrubbishnode(), "f");
@@ -5413,7 +4810,7 @@ TEST_F(SyncTest, CmdChecks_RRAttributeAfterMoveNode)
     future<bool> p1 = pclientA1->thread_do<bool>([](StandardClient& sc, PromiseBoolSP pb)
         {
             sc.movenodetotrash("f", pb);
-        }, __FILE__, __LINE__);
+        });
     ASSERT_TRUE(waitonresults(&p1));
 
     WaitMillisec(3000);  // allow for attribute delivery too
@@ -5428,7 +4825,13 @@ TEST_F(SyncTest, CmdChecks_RRAttributeAfterMoveNode)
     ASSERT_EQ(f->attrs.map[rrname], string(Base64Str<MegaClient::NODEHANDLE>(pclientA1->gettestbasenode()->nodehandle)));
 
     // move it back
-    ASSERT_TRUE(pclientA1->movenode(f->nodehandle, pclientA1->basefolderhandle));
+
+    p1 = pclientA1->thread_do<bool>([&](StandardClient& sc, PromiseBoolSP pb)
+    {
+        sc.movenode(f->nodehandle, pclientA1->basefolderhandle, pb);
+    });
+    ASSERT_TRUE(waitonresults(&p1));
+
     WaitMillisec(3000);  // allow for attribute delivery too
 
     // check it's back and the rr attribute is gone
@@ -5576,11 +4979,9 @@ Node* makenode(MegaClient& mc, NodeHandle parent, ::mega::nodetype_t type, m_off
 TEST_F(SyncTest, NodeSorting_forPhotosAndVideos)
 {
     fs::path localtestroot = makeNewTestRoot();
-
-    // Don't use ClientManager or running PutnodesForMultipleFolders after this breaks
-
     StandardClient standardclient(localtestroot, "sortOrderTests");
     auto& client = standardclient.client;
+
     handle owner = 99999;
 
     ::mega::byte key[] = { 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04 };
@@ -5622,25 +5023,23 @@ TEST_F(SyncTest, NodeSorting_forPhotosAndVideos)
 TEST_F(SyncTest, PutnodesForMultipleFolders)
 {
     fs::path localtestroot = makeNewTestRoot();
-
-    auto standardclient = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-
-    ASSERT_TRUE(standardclient->resetBaseFolderMulticlient());
-    ASSERT_TRUE(CatchupClients(standardclient));
+    StandardClient standardclient(localtestroot, "PutnodesForMultipleFolders");
+    ASSERT_TRUE(standardclient.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD", true));
 
     vector<NewNode> newnodes(4);
-    standardclient->client.putnodes_prepareOneFolder(&newnodes[0], "folder1");
-    standardclient->client.putnodes_prepareOneFolder(&newnodes[1], "folder2");
-    standardclient->client.putnodes_prepareOneFolder(&newnodes[2], "folder2.1");
-    standardclient->client.putnodes_prepareOneFolder(&newnodes[3], "folder2.2");
+
+    standardclient.client.putnodes_prepareOneFolder(&newnodes[0], "folder1");
+    standardclient.client.putnodes_prepareOneFolder(&newnodes[1], "folder2");
+    standardclient.client.putnodes_prepareOneFolder(&newnodes[2], "folder2.1");
+    standardclient.client.putnodes_prepareOneFolder(&newnodes[3], "folder2.2");
 
     newnodes[1].nodehandle = newnodes[2].parenthandle = newnodes[3].parenthandle = 2;
 
-    auto targethandle = standardclient->client.rootnodes.files;
+    auto targethandle = standardclient.client.rootnodes.files;
 
     std::atomic<bool> putnodesDone{false};
-    standardclient->resultproc.prepresult(StandardClient::PUTNODES,  ++next_request_tag,
-        [&](){ standardclient->client.putnodes(targethandle, NoVersioning, move(newnodes), nullptr, standardclient->client.reqtag); },
+    standardclient.resultproc.prepresult(StandardClient::PUTNODES,  ++next_request_tag,
+        [&](){ standardclient.client.putnodes(targethandle, NoVersioning, move(newnodes), nullptr, standardclient.client.reqtag); },
         [&putnodesDone](error e) { putnodesDone = true; return true; });
 
     while (!putnodesDone)
@@ -5648,12 +5047,12 @@ TEST_F(SyncTest, PutnodesForMultipleFolders)
         WaitMillisec(100);
     }
 
-    Node* cloudRoot = standardclient->client.nodeByHandle(targethandle);
+    Node* cloudRoot = standardclient.client.nodeByHandle(targethandle);
 
-    ASSERT_TRUE(nullptr != standardclient->drillchildnodebyname(cloudRoot, "folder1"));
-    ASSERT_TRUE(nullptr != standardclient->drillchildnodebyname(cloudRoot, "folder2"));
-    ASSERT_TRUE(nullptr != standardclient->drillchildnodebyname(cloudRoot, "folder2/folder2.1"));
-    ASSERT_TRUE(nullptr != standardclient->drillchildnodebyname(cloudRoot, "folder2/folder2.2"));
+    ASSERT_TRUE(nullptr != standardclient.drillchildnodebyname(cloudRoot, "folder1"));
+    ASSERT_TRUE(nullptr != standardclient.drillchildnodebyname(cloudRoot, "folder2"));
+    ASSERT_TRUE(nullptr != standardclient.drillchildnodebyname(cloudRoot, "folder2/folder2.1"));
+    ASSERT_TRUE(nullptr != standardclient.drillchildnodebyname(cloudRoot, "folder2/folder2.2"));
 }
 
 // this test fails frequently on develop due to race conditions with commands vs actionpackets on develop, re-enable after merging sync rework (which has SIC removed)
@@ -5668,7 +5067,7 @@ TEST_F(SyncTest, DISABLED_ExerciseCommands)
     // disallow or shortcut.
 
     // make sure it's a brand new folder
-    future<bool> p1 = standardclient.thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.makeCloudSubdirs("testlinkfolder_brandnew3", 1, 1, pb); }, __FILE__, __LINE__);
+    future<bool> p1 = standardclient.thread_do<bool>([=](StandardClient& sc, PromiseBoolSP pb) { sc.makeCloudSubdirs("testlinkfolder_brandnew3", 1, 1, pb); });
     ASSERT_TRUE(waitonresults(&p1));
 
     assert(standardclient.lastPutnodesResultFirstHandle != UNDEF);
@@ -5751,57 +5150,55 @@ TEST_F(SyncTest, BasicSync_CreateRenameAndDeleteLink)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    auto clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    auto clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 1, 1));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
-
-    ASSERT_EQ(clientA1->basefolderhandle, clientA2->basefolderhandle);
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 1, 1));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 1, 1, 0));
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
 
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
 
     // move something in the local filesystem and see if we catch up in A1 and A2 (deleter and observer syncs)
     error_code linkage_error;
-    fs::create_symlink(clientA1->syncSet(backupId1).localpath / "f_0", clientA1->syncSet(backupId1).localpath / "linked", linkage_error);
+    fs::create_symlink(clientA1.syncSet(backupId1).localpath / "f_0", clientA1.syncSet(backupId1).localpath / "linked", linkage_error);
     ASSERT_TRUE(!linkage_error) << linkage_error;
 
     // let them catch up
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     //check client 2 is unaffected
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
-    fs::rename(clientA1->syncSet(backupId1).localpath / "linked", clientA1->syncSet(backupId1).localpath / "linkrenamed", linkage_error);
+    fs::rename(clientA1.syncSet(backupId1).localpath / "linked", clientA1.syncSet(backupId1).localpath / "linkrenamed", linkage_error);
 
     // let them catch up
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     //check client 2 is unaffected
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
-    fs::remove(clientA1->syncSet(backupId1).localpath / "linkrenamed");
+    fs::remove(clientA1.syncSet(backupId1).localpath / "linkrenamed");
 
     // let them catch up
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     //check client 2 is unaffected
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 }
 
 #ifndef WIN32
@@ -5812,67 +5209,65 @@ TEST_F(SyncTest, BasicSync_CreateAndReplaceLinkLocally)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    auto clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    auto clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 1, 1));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
-
-    ASSERT_EQ(clientA1->basefolderhandle, clientA2->basefolderhandle);
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 1, 1));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 1, 1, 0));
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
 
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
 
     // move something in the local filesystem and see if we catch up in A1 and A2 (deleter and observer syncs)
     error_code linkage_error;
-    fs::create_symlink(clientA1->syncSet(backupId1).localpath / "f_0", clientA1->syncSet(backupId1).localpath / "linked", linkage_error);
+    fs::create_symlink(clientA1.syncSet(backupId1).localpath / "f_0", clientA1.syncSet(backupId1).localpath / "linked", linkage_error);
     ASSERT_TRUE(!linkage_error) << linkage_error;
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
     // let them catch up
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     //check client 2 is unaffected
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
-    fs::rename(clientA1->syncSet(backupId1).localpath / "f_0", clientA1->syncSet(backupId1).localpath / "linked", linkage_error);
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
+    fs::rename(clientA1.syncSet(backupId1).localpath / "f_0", clientA1.syncSet(backupId1).localpath / "linked", linkage_error);
 
     // let them catch up
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     //check client 2 is unaffected
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
-    fs::remove(clientA1->syncSet(backupId1).localpath / "linked");
+    fs::remove(clientA1.syncSet(backupId1).localpath / "linked");
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
-    ASSERT_TRUE(createNameFile(clientA1->syncSet(backupId1).localpath, "linked"));
+    ASSERT_TRUE(createNameFile(clientA1.syncSet(backupId1).localpath, "linked"));
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
     // Wait for the engine to synchronize changes.
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     model.findnode("f")->addkid(model.makeModelSubfile("linked"));
     model.ensureLocalDebrisTmpLock("f"); // since we downloaded files
 
     //check client 2 is as expected
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 }
 
 
@@ -5880,51 +5275,50 @@ TEST_F(SyncTest, BasicSync_CreateAndReplaceLinkUponSyncDown)
 {
     // confirm change is synced to remote, and also seen and applied in a second client that syncs the same folder
     fs::path localtestroot = makeNewTestRoot();
+    StandardClient clientA1(localtestroot, "clientA1");   // user 1 client 1
+    StandardClient clientA2(localtestroot, "clientA2");   // user 1 client 2
 
-    auto clientA1 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    auto clientA2 = g_clientManager->getCleanStandardClient(0, localtestroot); // user 1 client 2
-    ASSERT_TRUE(clientA1->resetBaseFolderMulticlient(clientA2));
-    ASSERT_TRUE(clientA1->makeCloudSubdirs("f", 1, 1));
-    ASSERT_TRUE(CatchupClients(clientA1, clientA2));
-    ASSERT_EQ(clientA1->basefolderhandle, clientA2->basefolderhandle);
+    ASSERT_TRUE(clientA1.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "f", 1, 1));
+    ASSERT_TRUE(clientA2.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+    ASSERT_EQ(clientA1.basefolderhandle, clientA2.basefolderhandle);
 
     Model model;
     model.root->addkid(model.buildModelSubdirs("f", 1, 1, 0));
 
     // set up sync for A1, it should build matching local folders
-    handle backupId1 = clientA1->setupSync_mainthread("sync1", "f", false, true);
+    handle backupId1 = clientA1.setupSync_mainthread("sync1", "f", false, true);
     ASSERT_NE(backupId1, UNDEF);
-    handle backupId2 = clientA2->setupSync_mainthread("sync2", "f", false, false);
+    handle backupId2 = clientA2.setupSync_mainthread("sync2", "f", false, false);
     ASSERT_NE(backupId2, UNDEF);
 
-    waitonsyncs(std::chrono::seconds(4), clientA1, clientA2);
-    clientA1->logcb = clientA2->logcb = true;
+    waitonsyncs(std::chrono::seconds(4), &clientA1, &clientA2);
+    clientA1.logcb = clientA2.logcb = true;
     // check everything matches (model has expected state of remote and local)
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
     // move something in the local filesystem and see if we catch up in A1 and A2 (deleter and observer syncs)
     error_code linkage_error;
-    fs::create_symlink(clientA1->syncSet(backupId1).localpath / "f_0", clientA1->syncSet(backupId1).localpath / "linked", linkage_error);
+    fs::create_symlink(clientA1.syncSet(backupId1).localpath / "f_0", clientA1.syncSet(backupId1).localpath / "linked", linkage_error);
     ASSERT_TRUE(!linkage_error) << linkage_error;
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
     // let them catch up
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     //check client 2 is unaffected
-    ASSERT_TRUE(clientA2->confirmModel_mainthread(model.findnode("f"), backupId2));
+    ASSERT_TRUE(clientA2.confirmModel_mainthread(model.findnode("f"), backupId2));
 
-    ASSERT_TRUE(createNameFile(clientA2->syncSet(backupId2).localpath, "linked"));
+    ASSERT_TRUE(createNameFile(clientA2.syncSet(backupId2).localpath, "linked"));
 
-    clientA2->triggerPeriodicScanEarly(backupId2);
+    clientA2.triggerPeriodicScanEarly(backupId2);
 
     // let them catch up
 
-    clientA1->triggerPeriodicScanEarly(backupId1);
+    clientA1.triggerPeriodicScanEarly(backupId1);
 
-    waitonsyncs(DEFAULTWAIT, clientA1, clientA2);
+    waitonsyncs(DEFAULTWAIT, &clientA1, &clientA2);
 
     model.findnode("f")->addkid(model.makeModelSubfolder("linked")); //notice: the deleted here is folder because what's actually deleted is a symlink that points to a folder
                                                                      //ideally we could add full support for symlinks in this tests suite
@@ -5934,7 +5328,7 @@ TEST_F(SyncTest, BasicSync_CreateAndReplaceLinkUponSyncDown)
     model.ensureLocalDebrisTmpLock("f"); // since we downloaded files
 
     //check client 2 is as expected
-    ASSERT_TRUE(clientA1->confirmModel_mainthread(model.findnode("f"), backupId1));
+    ASSERT_TRUE(clientA1.confirmModel_mainthread(model.findnode("f"), backupId1));
 }
 #endif
 
@@ -5948,18 +5342,17 @@ TEST_F(SyncTest, BasicSync_NewVersionsCreatedWhenFilesModified)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = std::chrono::seconds(4);
 
-    auto c = g_clientManager->getCleanStandardClient(0, TESTROOT);
-    CatchupClients(c);
+    StandardClient c(TESTROOT, "c");
 
     // Log callbacks.
-    c->logcb = true;
+    c.logcb = true;
 
     // Helper for generating fingerprints.
     auto fingerprint =
       [&c](const fs::path& fsPath) -> FileFingerprintPtr
       {
           // Convenience.
-          auto& fsAccess = *c->client.fsaccess;
+          auto& fsAccess = *c.client.fsaccess;
 
           // Needed so we can access the filesystem.
           auto fileAccess = fsAccess.newfileaccess(false);
@@ -5986,16 +5379,13 @@ TEST_F(SyncTest, BasicSync_NewVersionsCreatedWhenFilesModified)
     vector<FileFingerprintPtr> fingerprints;
 
     // Log client in.
-    //ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "x", 0, 0));
-    ASSERT_TRUE(c->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c->makeCloudSubdirs("x", 0, 0));
-    ASSERT_TRUE(CatchupClients(c));
+    ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "x", 0, 0));
 
     // Add and start sync.
-    const auto id = c->setupSync_mainthread("s", "x", false, true);
+    const auto id = c.setupSync_mainthread("s", "x", false, true);
     ASSERT_NE(id, UNDEF);
 
-    const auto SYNCROOT = c->syncSet(id).localpath;
+    const auto SYNCROOT = c.syncSet(id).localpath;
 
     // Create and populate model.
     Model model;
@@ -6007,13 +5397,13 @@ TEST_F(SyncTest, BasicSync_NewVersionsCreatedWhenFilesModified)
     fingerprints.emplace_back(fingerprint(SYNCROOT / "f"));
     ASSERT_TRUE(fingerprints.back());
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for initial sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Check that the file made it to the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Create a new revision of f.
     model.addfile("f", "b");
@@ -6023,13 +5413,13 @@ TEST_F(SyncTest, BasicSync_NewVersionsCreatedWhenFilesModified)
     fingerprints.emplace_back(fingerprint(SYNCROOT / "f"));
     ASSERT_TRUE(fingerprints.back());
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for change to propagate.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Validate model.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Create yet anothet revision of f.
     model.addfile("f", "c");
@@ -6039,16 +5429,16 @@ TEST_F(SyncTest, BasicSync_NewVersionsCreatedWhenFilesModified)
     fingerprints.emplace_back(fingerprint(SYNCROOT / "f"));
     ASSERT_TRUE(fingerprints.back());
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for change to propagate.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Validate model.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Get our hands on f's node.
-    auto *f = c->drillchildnodebyname(c->gettestbasenode(), "x/f");
+    auto *f = c.drillchildnodebyname(c.gettestbasenode(), "x/f");
     ASSERT_TRUE(f);
 
     // Validate the version chain.
@@ -6802,27 +6192,22 @@ TEST_F(SyncTest, AnomalousManualDownload)
     auto TESTROOT = makeNewTestRoot();
     auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse cu = g_clientManager->getCleanStandardClient(0, TESTROOT);
-    StandardClientInUse cd = g_clientManager->getCleanStandardClient(0, TESTROOT);
-
-    // Log callbacks.
-    cu->logcb = true;
-    cd->logcb = true;
-
-    // Log in client.
-    ASSERT_TRUE(cu->resetBaseFolderMulticlient(cd));
-    ASSERT_TRUE(cu->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cu, cd));
-
     // Upload two files for us to download.
     {
+        StandardClient cu(TESTROOT, "cu");
+
+        // Log callbacks.
+        cu.logcb = true;
+
+        // Log client in.
+        ASSERT_TRUE(cu.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
         // Create a sync so we can upload some files.
-        auto id = cu->setupSync_mainthread("s", "s", false, false);
+        auto id = cu.setupSync_mainthread("s", "s", false, false);
         ASSERT_NE(id, UNDEF);
 
         // Get our hands on the sync root.
-        auto root = cu->syncSet(id).localpath;
+        auto root = cu.syncSet(id).localpath;
 
         // Create the test files.
         Model model;
@@ -6831,27 +6216,35 @@ TEST_F(SyncTest, AnomalousManualDownload)
         model.addfile("g:0")->fsName("g%3a0");
         model.generate(root);
 
-        cu->triggerPeriodicScanEarly(id);
+        cu.triggerPeriodicScanEarly(id);
 
         // Wait for the upload to complete.
-        waitonsyncs(TIMEOUT, cu);
+        waitonsyncs(TIMEOUT, &cu);
 
         // Make sure the files were uploaded.
-        ASSERT_TRUE(cu->confirmModel_mainthread(model.root.get(), id));
+        ASSERT_TRUE(cu.confirmModel_mainthread(model.root.get(), id));
     }
 
+    StandardClient cd(TESTROOT, "cd");
+
+    // Log callbacks.
+    cd.logcb = true;
+
+    // Log client in.
+    ASSERT_TRUE(cd.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+
     // Determine root paths.
-    auto root = cd->fsBasePath;
+    auto root = TESTROOT / "cd";
 
     // Set anomalous filename reporter.
     AnomalyReporter* reporter =
       new AnomalyReporter(LocalPath::fromAbsolutePath(root.u8string()),
-                          cd->gettestbasenode()->displaypath());
+                          cd.gettestbasenode()->displaypath());
 
-    cd->client.mFilenameAnomalyReporter.reset(reporter);
+    cd.client.mFilenameAnomalyReporter.reset(reporter);
 
     // cu's sync root.
-    auto* s = cd->drillchildnodebyname(cd->gettestbasenode(), "s");
+    auto* s = cd.drillchildnodebyname(cd.gettestbasenode(), "s");
     ASSERT_TRUE(s);
 
     // Simple validation helper.
@@ -6875,12 +6268,12 @@ TEST_F(SyncTest, AnomalousManualDownload)
     // Download a regular file.
     {
         // Regular file, s/f.
-        auto* f = cd->drillchildnodebyname(s, "f");
+        auto* f = cd.drillchildnodebyname(s, "f");
         ASSERT_TRUE(f);
 
         // Download.
         auto destination = root / "f";
-        ASSERT_TRUE(cd->downloadFile(*f, destination));
+        ASSERT_TRUE(cd.downloadFile(*f, destination));
 
         // Make sure the file was downloaded.
         ASSERT_TRUE(fs::is_regular_file(destination));
@@ -6893,12 +6286,12 @@ TEST_F(SyncTest, AnomalousManualDownload)
     // Download an anomalous file.
     {
         // Anomalous file, s/g:0.
-        auto* g0 = cd->drillchildnodebyname(s, "g:0");
+        auto* g0 = cd.drillchildnodebyname(s, "g:0");
         ASSERT_TRUE(g0);
 
         // Download.
         auto destination = root / "g%3a0";
-        ASSERT_TRUE(cd->downloadFile(*g0, destination));
+        ASSERT_TRUE(cd.downloadFile(*g0, destination));
 
         // Make sure the file was downloaded.
         ASSERT_TRUE(fs::is_regular_file(destination));
@@ -6920,31 +6313,32 @@ TEST_F(SyncTest, AnomalousManualUpload)
     auto TESTROOT = makeNewTestRoot();
     auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse cu = g_clientManager->getCleanStandardClient(0, TESTROOT);
-    StandardClientInUse cv = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    // Upload client.
+    StandardClient cu(TESTROOT, "cu");
+
+    // Verification client.
+    StandardClient cv(TESTROOT, "cv");
 
     // Log callbacks.
-    cu->logcb = true;
-    cv->logcb = true;
+    cu.logcb = true;
+    cv.logcb = true;
 
     // Log in clients.
-    // Log in client.
-    ASSERT_TRUE(cu->resetBaseFolderMulticlient(cv));
-    ASSERT_TRUE(cu->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cu, cv));
+    ASSERT_TRUE(cu.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
+    ASSERT_TRUE(cv.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
 
     // Determine local root.
-    auto root = cu->fsBasePath;
+    auto root = TESTROOT / "cu";
 
     // Set up anomalous name reporter.
     AnomalyReporter* reporter =
       new AnomalyReporter(LocalPath::fromAbsolutePath(root.u8string()),
-                          cu->gettestbasenode()->displaypath());
+                          cu.gettestbasenode()->displaypath());
 
-    cu->client.mFilenameAnomalyReporter.reset(reporter);
+    cu.client.mFilenameAnomalyReporter.reset(reporter);
 
     // Create a sync so we can verify uploads.
-    auto id = cv->setupSync_mainthread("s", "s", false, false);
+    auto id = cv.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
     Model model;
@@ -6956,17 +6350,17 @@ TEST_F(SyncTest, AnomalousManualUpload)
         model.generate(root);
 
         // Upload file.
-        auto* s = cu->client.nodeByHandle(cv->syncSet(id).h);
+        auto* s = cu.client.nodeByHandle(cv.syncSet(id).h);
         ASSERT_TRUE(s);
-        ASSERT_TRUE(cu->uploadFile(root / "f0", s));
+        ASSERT_TRUE(cu.uploadFile(root / "f0", s));
 
         // Necessary as cv has downloaded a file.
         model.ensureLocalDebrisTmpLock("");
 
         // Make sure the file uploaded successfully.
-        waitonsyncs(TIMEOUT, cv);
+        waitonsyncs(TIMEOUT, &cv);
 
-        ASSERT_TRUE(cv->confirmModel_mainthread(model.root.get(), id));
+        ASSERT_TRUE(cv.confirmModel_mainthread(model.root.get(), id));
 
         // No anomalies should be reported.
         ASSERT_TRUE(reporter->mAnomalies.empty());
@@ -6979,14 +6373,14 @@ TEST_F(SyncTest, AnomalousManualUpload)
         model.generate(root);
 
         // Upload file.
-        auto* s = cu->client.nodeByHandle(cv->syncSet(id).h);
+        auto* s = cu.client.nodeByHandle(cv.syncSet(id).h);
         ASSERT_TRUE(s);
-        ASSERT_TRUE(cu->uploadFile(root / "f%3a0", "f:0", s));
+        ASSERT_TRUE(cu.uploadFile(root / "f%3a0", "f:0", s));
 
         // Make sure the file uploaded ok.
-        waitonsyncs(TIMEOUT, cv);
+        waitonsyncs(TIMEOUT, &cv);
 
-        ASSERT_TRUE(cv->confirmModel_mainthread(model.root.get(), id));
+        ASSERT_TRUE(cv.confirmModel_mainthread(model.root.get(), id));
 
         // A single anomaly should've been reported.
         ASSERT_EQ(reporter->mAnomalies.size(), 1u);
@@ -7007,30 +6401,27 @@ TEST_F(SyncTest, AnomalousSyncDownload)
     // For verification.
     Model model;
 
-    StandardClientInUse cu = g_clientManager->getCleanStandardClient(0, TESTROOT);
-    StandardClientInUse cd = g_clientManager->getCleanStandardClient(0, TESTROOT);
-
-    // Log callbacks.
-    cu->logcb = true;
-    cd->logcb = true;
-
-    // Log in client.
-    ASSERT_TRUE(cu->resetBaseFolderMulticlient(cd));
-    ASSERT_TRUE(cu->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cu, cd));
-
     // Upload test files.
     {
+        // Upload client.
+        StandardClient cu(TESTROOT, "cu");
+
+        // Log callbacks.
+        cu.logcb = true;
+
+        // Log in client.
+        ASSERT_TRUE(cu.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
+
         // Create the directories d and d/0.
         {
             vector<NewNode> nodes(2);
 
             // Prepare nodes.
-            cu->client.putnodes_prepareOneFolder(&nodes[0], "d");
-            cu->client.putnodes_prepareOneFolder(&nodes[1], "d/0");
+            cu.client.putnodes_prepareOneFolder(&nodes[0], "d");
+            cu.client.putnodes_prepareOneFolder(&nodes[1], "d/0");
 
             // Create the nodes in the cloud.
-            ASSERT_TRUE(cu->putnodes("s", NoVersioning, std::move(nodes)));
+            ASSERT_TRUE(cu.putnodes("s", NoVersioning, std::move(nodes)));
 
             // Update model.
             model.addfolder("d");
@@ -7039,15 +6430,15 @@ TEST_F(SyncTest, AnomalousSyncDownload)
 
         // Upload the files f and f/0.
         {
-            auto filePath = cu->fsBasePath / "f";
-            auto rootPath = string("s");
+            auto filePath = cu.fsBasePath / "f";
+            auto rootPath = string("/mega_test_sync/s");
 
             // Create a dummy for us to upload.
             ASSERT_TRUE(createDataFile(filePath, "f"));
 
             // Upload the files.
-            ASSERT_TRUE(cu->uploadFile(filePath, string("f"), rootPath));
-            ASSERT_TRUE(cu->uploadFile(filePath, string("f/0"), rootPath));
+            ASSERT_TRUE(cu.uploadFile(filePath, string("f"), rootPath));
+            ASSERT_TRUE(cu.uploadFile(filePath, string("f/0"), rootPath));
 
             // Update the model.
             model.addfile("f", "f");
@@ -7055,37 +6446,43 @@ TEST_F(SyncTest, AnomalousSyncDownload)
         }
     }
 
+    // Download test files.
+    StandardClient cd(TESTROOT, "cd");
+
+    // Log client in.
+    ASSERT_TRUE(cd.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+
     // Set anomalous filename reporter.
     AnomalyReporter* reporter;
     {
-        auto* root = cd->gettestbasenode();
+        auto* root = cd.gettestbasenode();
         ASSERT_TRUE(root);
 
-        auto* s = cd->drillchildnodebyname(root, "s");
+        auto* s = cd.drillchildnodebyname(root, "s");
         ASSERT_TRUE(s);
 
-        auto local = (cd->fsBasePath / "s").u8string();
+        auto local = (TESTROOT / "cd" / "s").u8string();
         auto remote = s->displaypath();
 
         reporter = new AnomalyReporter(LocalPath::fromAbsolutePath(local), remote);
-        cd->client.mFilenameAnomalyReporter.reset(reporter);
+        cd.client.mFilenameAnomalyReporter.reset(reporter);
     }
 
     // Add and start sync.
-    auto id = cd->setupSync_mainthread("s", "s", false, false);
+    auto id = cd.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
     // Get our hands on the sync root.
-    auto root = cd->syncSet(id).localpath;
+    auto root = cd.syncSet(id).localpath;
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, cd);
+    waitonsyncs(TIMEOUT, &cd);
 
     // Necessary as cd has downloaded files.
     model.ensureLocalDebrisTmpLock("");
 
     // Were all the files downloaded okay?
-    ASSERT_TRUE(cd->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cd.confirmModel_mainthread(model.root.get(), id));
 
     // Two anomalies should be reported.
     ASSERT_EQ(reporter->mAnomalies.size(), 2u);
@@ -7110,27 +6507,23 @@ TEST_F(SyncTest, AnomalousSyncLocalRename)
     auto TESTROOT = makeNewTestRoot();
     auto TIMEOUT = chrono::seconds(4);
 
-    StandardClientInUse cx = g_clientManager->getCleanStandardClient(0, TESTROOT);
-
-    // Log callbacks.
-    cx->logcb = true;
+    // Sync client.
+    StandardClient cx(TESTROOT, "cx");
 
     // Log in client.
-    ASSERT_TRUE(cx->resetBaseFolderMulticlient());
-    ASSERT_TRUE(cx->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cx));
+    ASSERT_TRUE(cx.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Add and start sync.
-    auto id = cx->setupSync_mainthread("s", "s", false, false);
+    auto id = cx.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
-    auto root = cx->syncSet(id).localpath;
+    auto root = cx.syncSet(id).localpath;
 
     // Set anomalous filename reporter.
     AnomalyReporter* reporter =
       new AnomalyReporter(LocalPath::fromAbsolutePath(root.u8string()), "/mega_test_sync/s");
 
-    cx->client.mFilenameAnomalyReporter.reset(reporter);
+    cx.client.mFilenameAnomalyReporter.reset(reporter);
 
     // Populate filesystem.
     Model model;
@@ -7139,25 +6532,25 @@ TEST_F(SyncTest, AnomalousSyncLocalRename)
     model.addfile("f");
     model.generate(root);
 
-    cx->triggerPeriodicScanEarly(id);
+    cx.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, cx);
+    waitonsyncs(TIMEOUT, &cx);
 
     // Make sure everything uploaded okay.
-    ASSERT_TRUE(cx->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cx.confirmModel_mainthread(model.root.get(), id));
 
     // Rename d/f -> d/g.
     model.findnode("d/f")->name = "g";
     fs::rename(root / "d" / "f", root / "d" / "g");
 
-    cx->triggerPeriodicScanEarly(id);
+    cx.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, cx);
+    waitonsyncs(TIMEOUT, &cx);
 
     // Confirm move.
-    ASSERT_TRUE(cx->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cx.confirmModel_mainthread(model.root.get(), id));
 
     // There should be no anomalies.
     ASSERT_TRUE(reporter->mAnomalies.empty());
@@ -7166,13 +6559,13 @@ TEST_F(SyncTest, AnomalousSyncLocalRename)
     model.findnode("d/g")->fsName("g%3a0").name = "g:0";
     fs::rename(root / "d" / "g", root / "d" / "g%3a0");
 
-    cx->triggerPeriodicScanEarly(id);
+    cx.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, cx);
+    waitonsyncs(TIMEOUT, &cx);
 
     // Confirm move.
-    ASSERT_TRUE(cx->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cx.confirmModel_mainthread(model.root.get(), id));
 
     // There should be a single anomaly.
     ASSERT_EQ(reporter->mAnomalies.size(), 1u);
@@ -7190,13 +6583,13 @@ TEST_F(SyncTest, AnomalousSyncLocalRename)
     model.removenode("f");
     fs::rename(root / "f", root / "d" / "g%3a0");
 
-    cx->triggerPeriodicScanEarly(id);
+    cx.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, cx);
+    waitonsyncs(TIMEOUT, &cx);
 
     // Confirm move.
-    ASSERT_TRUE(cx->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cx.confirmModel_mainthread(model.root.get(), id));
 
     // No anomalies should be reported.
     ASSERT_TRUE(reporter->mAnomalies.empty());
@@ -7207,27 +6600,25 @@ TEST_F(SyncTest, AnomalousSyncRemoteRename)
     auto TESTROOT = makeNewTestRoot();
     auto TIMEOUT = chrono::seconds(4);
 
-    StandardClientInUse cx = g_clientManager->getCleanStandardClient(0, TESTROOT);
-    StandardClientInUse cr = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    // Sync client.
+    StandardClient cx(TESTROOT, "cx");
 
-    // Log callbacks.
-    cx->logcb = true;
-    cr->logcb = true;
+    // Rename client.
+    StandardClient cr(TESTROOT, "cr");
 
-    // Log in client.
-    ASSERT_TRUE(cx->resetBaseFolderMulticlient(cr));
-    ASSERT_TRUE(cx->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cx, cr));
+    // Log in clients.
+    ASSERT_TRUE(cx.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
+    ASSERT_TRUE(cr.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
 
     // Add and start sync.
-    auto id = cx->setupSync_mainthread("s", "s", false, false);
+    auto id = cx.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
-    auto root = cx->syncSet(id).localpath;
+    auto root = cx.syncSet(id).localpath;
 
     // Set up anomalous filename reporter.
     auto* reporter = new AnomalyReporter(LocalPath::fromAbsolutePath(root.u8string()), "/mega_test_sync/s");
-    cx->client.mFilenameAnomalyReporter.reset(reporter);
+    cx.client.mFilenameAnomalyReporter.reset(reporter);
 
     // Populate filesystem.
     Model model;
@@ -7236,56 +6627,56 @@ TEST_F(SyncTest, AnomalousSyncRemoteRename)
     model.addfile("f");
     model.generate(root);
 
-    cx->triggerPeriodicScanEarly(id);
+    cx.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, cx);
+    waitonsyncs(TIMEOUT, &cx);
 
     // Verify upload.
-    ASSERT_TRUE(cx->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cx.confirmModel_mainthread(model.root.get(), id));
 
     // Rename d/f -> d/g.
-    auto* s = cr->client.nodeByHandle(cx->syncSet(id).h);
+    auto* s = cr.client.nodeByHandle(cx.syncSet(id).h);
     ASSERT_TRUE(s);
 
-    auto* d = cr->drillchildnodebyname(s, "d");
+    auto* d = cr.drillchildnodebyname(s, "d");
     ASSERT_TRUE(d);
 
     {
-        auto* f = cr->drillchildnodebyname(d, "f");
+        auto* f = cr.drillchildnodebyname(d, "f");
         ASSERT_TRUE(f);
 
-        ASSERT_TRUE(cr->setattr(f, attr_map('n', "g")));
+        ASSERT_TRUE(cr.setattr(f, attr_map('n', "g")));
     }
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, cx);
+    waitonsyncs(TIMEOUT, &cx);
 
     // Update model.
     model.findnode("d/f")->name = "g";
 
     // Verify rename.
-    ASSERT_TRUE(cx->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cx.confirmModel_mainthread(model.root.get(), id));
 
     // There should be no anomalies.
     ASSERT_TRUE(reporter->mAnomalies.empty());
 
     // Rename d/g -> d/g:0.
     {
-        auto* g = cr->drillchildnodebyname(d, "g");
+        auto* g = cr.drillchildnodebyname(d, "g");
         ASSERT_TRUE(g);
 
-        ASSERT_TRUE(cr->setattr(g, attr_map('n', "g/0")));
+        ASSERT_TRUE(cr.setattr(g, attr_map('n', "g/0")));
     }
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, cx);
+    waitonsyncs(TIMEOUT, &cx);
 
     // Update model.
     model.findnode("d/g")->fsName("g%2f0").name = "g/0";
 
     // Verify rename.
-    ASSERT_TRUE(cx->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cx.confirmModel_mainthread(model.root.get(), id));
 
     // There should be a single anomaly.
     ASSERT_EQ(reporter->mAnomalies.size(), 1u);
@@ -7304,27 +6695,23 @@ TEST_F(SyncTest, AnomalousSyncUpload)
     auto TESTROOT = makeNewTestRoot();
     auto TIMEOUT = chrono::seconds(4);
 
-    StandardClientInUse cu = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    // Upload client.
+    StandardClient cu(TESTROOT, "cu");
 
-    // Log callbacks.
-    cu->logcb = true;
-
-    // Log in client.
-    ASSERT_TRUE(cu->resetBaseFolderMulticlient());
-    ASSERT_TRUE(cu->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cu));
+    // Log client in.
+    ASSERT_TRUE(cu.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Add and start sync.
-    auto id = cu->setupSync_mainthread("s", "s", false, false);
+    auto id = cu.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
-    auto root = cu->syncSet(id).localpath;
+    auto root = cu.syncSet(id).localpath;
 
     // Set up anomalous filename reporter.
     AnomalyReporter* reporter =
       new AnomalyReporter(LocalPath::fromAbsolutePath(root.u8string()), "/mega_test_sync/s");
 
-    cu->client.mFilenameAnomalyReporter.reset(reporter);
+    cu.client.mFilenameAnomalyReporter.reset(reporter);
 
     // Populate filesystem.
     Model model;
@@ -7335,25 +6722,13 @@ TEST_F(SyncTest, AnomalousSyncUpload)
     model.addfolder("d:0")->fsName("d%3a0");
     model.generate(root);
 
-    cu->triggerPeriodicScanEarly(id);
+    cu.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, cu);
-
-    // Wait for the files to appear in the cloud.
-    {
-        auto* root = cu->gettestbasenode();
-        ASSERT_NE(root, nullptr);
-
-        root = cu->drillchildnodebyname(root, "s");
-        ASSERT_NE(root, nullptr);
-
-        auto predicate = SyncRemoteMatch(*root, model.root.get());
-        ASSERT_TRUE(cu->waitFor(std::move(predicate), TIMEOUT));
-    }
+    waitonsyncs(TIMEOUT, &cu);
 
     // Ensure everything uploaded okay.
-    ASSERT_TRUE(cu->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(cu.confirmModel_mainthread(model.root.get(), id));
 
     // Two anomalies should've been reported.
     ASSERT_EQ(reporter->mAnomalies.size(), 2u);
@@ -7504,28 +6879,25 @@ TEST_F(SyncTest, RenameReplaceFileBetweenSyncs)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse c0 = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c0(TESTROOT, "c0");
 
     // Log callbacks.
-    c0->logcb = true;
+    c0.logcb = true;
 
     // Log in client.
-    ASSERT_TRUE(c0->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c0->makeCloudSubdirs("s0", 0, 0));
-    ASSERT_TRUE(c0->makeCloudSubdirs("s1", 0, 0));
-    ASSERT_TRUE(CatchupClients(c0));
-    //ASSERT_TRUE(c0->login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s0", 0, 0));
+    ASSERT_TRUE(c0.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s0", 0, 0));
+    ASSERT_TRUE(c0.makeCloudSubdirs("s1", 0, 0));
 
     // Set up syncs.
-    const auto id0 = c0->setupSync_mainthread("s0", "s0", false, false);
+    const auto id0 = c0.setupSync_mainthread("s0", "s0", false, false);
     ASSERT_NE(id0, UNDEF);
 
-    const auto id1 = c0->setupSync_mainthread("s1", "s1", false, false);
+    const auto id1 = c0.setupSync_mainthread("s1", "s1", false, false);
     ASSERT_NE(id1, UNDEF);
 
     // Convenience.
-    const auto SYNCROOT0 = c0->fsBasePath / "s0";
-    const auto SYNCROOT1 = c0->fsBasePath / "s1";
+    const auto SYNCROOT0 = TESTROOT / "c0" / "s0";
+    const auto SYNCROOT1 = TESTROOT / "c0" / "s1";
 
     // Set up models.
     Model model0;
@@ -7534,14 +6906,14 @@ TEST_F(SyncTest, RenameReplaceFileBetweenSyncs)
     model0.addfile("f0", "x");
     model0.generate(SYNCROOT0);
 
-    c0->triggerPeriodicScanEarly(id0);
+    c0.triggerPeriodicScanEarly(id0);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c0);
+    waitonsyncs(TIMEOUT, &c0);
 
     // Confirm models.
-    ASSERT_TRUE(c0->confirmModel_mainthread(model0.root.get(), id0));
-    ASSERT_TRUE(c0->confirmModel_mainthread(model1.root.get(), id1));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model0.root.get(), id0));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model1.root.get(), id1));
 
     // Move s0/f0 to s1/f0.
     model1 = model0;
@@ -7554,28 +6926,28 @@ TEST_F(SyncTest, RenameReplaceFileBetweenSyncs)
 
     ASSERT_TRUE(createDataFile(SYNCROOT0 / "f0", "y"));
 
-    c0->triggerPeriodicScanEarly(id0);
-    c0->triggerPeriodicScanEarly(id1);
+    c0.triggerPeriodicScanEarly(id0);
+    c0.triggerPeriodicScanEarly(id1);
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c0);
+    waitonsyncs(TIMEOUT, &c0);
 
     // Confirm models.
-    ASSERT_TRUE(c0->confirmModel_mainthread(model0.root.get(), id0));
-    ASSERT_TRUE(c0->confirmModel_mainthread(model1.root.get(), id1));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model0.root.get(), id0));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model1.root.get(), id1));
 
     // Disable s0.
-    ASSERT_TRUE(c0->disableSync(id0, NO_SYNC_ERROR, false));
+    ASSERT_TRUE(c0.disableSync(id0, NO_SYNC_ERROR, false));
 
     // Make sure s0 is disabled.
     ASSERT_TRUE(createDataFile(SYNCROOT0 / "f1", "z"));
 
-    c0->triggerPeriodicScanEarly(id0);
+    c0.triggerPeriodicScanEarly(id0);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c0);
+    waitonsyncs(TIMEOUT, &c0);
 
     // Confirm models.
-    ASSERT_TRUE(c0->confirmModel_mainthread(
+    ASSERT_TRUE(c0.confirmModel_mainthread(
                   model0.root.get(),
                   id0,
                   false,
@@ -7591,20 +6963,20 @@ TEST_F(SyncTest, RenameReplaceFileBetweenSyncs)
 
     ASSERT_TRUE(createDataFile(SYNCROOT1 / "f0", "q"));
 
-    c0->triggerPeriodicScanEarly(id0);
-    c0->triggerPeriodicScanEarly(id1);
+    c0.triggerPeriodicScanEarly(id0);
+    c0.triggerPeriodicScanEarly(id1);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c0);
+    waitonsyncs(TIMEOUT, &c0);
 
     // Confirm models.
-    ASSERT_TRUE(c0->confirmModel_mainthread(
+    ASSERT_TRUE(c0.confirmModel_mainthread(
                   model0.root.get(),
                   id0,
                   false,
                   StandardClient::CONFIRM_REMOTE));
 
-    ASSERT_TRUE(c0->confirmModel_mainthread(model1.root.get(), id1));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model1.root.get(), id1));
 }
 
 TEST_F(SyncTest, RenameReplaceFileWithinSync)
@@ -7612,15 +6984,11 @@ TEST_F(SyncTest, RenameReplaceFileWithinSync)
     auto TESTROOT = makeNewTestRoot();
     auto TIMEOUT = std::chrono::seconds(8);
 
-    StandardClientInUse c = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    // Create the client.
+    auto c = ::mega::make_unique<StandardClient>(TESTROOT, "c");
 
-    // Log callbacks.
-    c->logcb = true;
-
-    // Log in client.
-    ASSERT_TRUE(c->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(c));
+    // Log in the client, taking care to clear the cloud.
+    ASSERT_TRUE(c->login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Populate model.
     Model m;
@@ -7643,7 +7011,7 @@ TEST_F(SyncTest, RenameReplaceFileWithinSync)
     ASSERT_NE(id, UNDEF);
 
     // Wait for the initial sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, c.get());
 
     // Make sure the initial sync was successful.
     ASSERT_TRUE(c->confirmModel_mainthread(m.root.get(), id));
@@ -7671,7 +7039,7 @@ TEST_F(SyncTest, RenameReplaceFileWithinSync)
         //c->triggerFullScan(id);
 
         // Wait for the change to be synchronized.
-        waitonsyncs(TIMEOUT, c);
+        waitonsyncs(TIMEOUT, c.get());
 
         // Was the change correctly synchronized?
         ASSERT_TRUE(c->confirmModel_mainthread(m.root.get(), id));
@@ -7702,7 +7070,7 @@ TEST_F(SyncTest, RenameReplaceFileWithinSync)
         //c->triggerFullScan(id);
 
         // Wait for the change to be synchronized.
-        waitonsyncs(TIMEOUT, c);
+        waitonsyncs(TIMEOUT, c.get());
 
         // Was the change correctly synchronized?
         ASSERT_TRUE(c->confirmModel_mainthread(m.root.get(), id));
@@ -7733,7 +7101,7 @@ TEST_F(SyncTest, RenameReplaceFileWithinSync)
         //c->triggerFullScan(id);
 
         // Wait for the change to be synchronized.
-        waitonsyncs(TIMEOUT, c);
+        waitonsyncs(TIMEOUT, c.get());
 
         // Was the change correctly synchronized?
         ASSERT_TRUE(c->confirmModel_mainthread(m.root.get(), id));
@@ -7847,35 +7215,33 @@ TEST_F(SyncTest, RenameReplaceFolderWithinSync)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse c0 = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c0(TESTROOT, "c0");
 
     // Log callbacks.
-    c0->logcb = true;
+    c0.logcb = true;
 
-    // Log in client.
-    ASSERT_TRUE(c0->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c0->makeCloudSubdirs("s0", 0, 0));
-    ASSERT_TRUE(CatchupClients(c0));
+    // Log in client and clear remote contents.
+    ASSERT_TRUE(c0.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s0", 0, 0));
 
     // Set up sync.
-    const auto id = c0->setupSync_mainthread("s0", "s0", false, false);
+    const auto id = c0.setupSync_mainthread("s0", "s0", false, false);
     ASSERT_NE(id, UNDEF);
 
     // Populate local FS.
-    const auto SYNCROOT = c0->fsBasePath / "s0";
+    const auto SYNCROOT = TESTROOT / "c0" / "s0";
 
     Model model;
 
     model.addfile("d1/f0");
     model.generate(SYNCROOT);
 
-    c0->triggerPeriodicScanEarly(id);
+    c0.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(chrono::seconds(15), c0);
+    waitonsyncs(chrono::seconds(15), &c0);
 
     // Confirm model.
-    ASSERT_TRUE(c0->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model.root.get(), id));
 
     // Rename /d1 to /d2.
     // This tests the case where the target is processed after the source.
@@ -7887,13 +7253,13 @@ TEST_F(SyncTest, RenameReplaceFolderWithinSync)
     // Replace /d1.
     fs::create_directories(SYNCROOT / "d1");
 
-    c0->triggerPeriodicScanEarly(id);
+    c0.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c0);
+    waitonsyncs(TIMEOUT, &c0);
 
     // Confirm model.
-    ASSERT_TRUE(c0->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model.root.get(), id));
 
     // Rename /d2 to /d0.
     // This tests the case where the target is processed before the source.
@@ -7905,13 +7271,13 @@ TEST_F(SyncTest, RenameReplaceFolderWithinSync)
     // Replace /d2.
     fs::create_directories(SYNCROOT / "d2");
 
-    c0->triggerPeriodicScanEarly(id);
+    c0.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c0);
+    waitonsyncs(TIMEOUT, &c0);
 
     // Confirm model.
-    ASSERT_TRUE(c0->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c0.confirmModel_mainthread(model.root.get(), id));
 }
 
 TEST_F(SyncTest, DownloadedDirectoriesHaveFilesystemWatch)
@@ -7919,59 +7285,57 @@ TEST_F(SyncTest, DownloadedDirectoriesHaveFilesystemWatch)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse c = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c(TESTROOT, "c");
 
     // Log callbacks.
-    c->logcb = true;
+    c.logcb = true;
 
     // Log in client.
-    ASSERT_TRUE(c->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(c));
+    ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Create /d in the cloud.
     {
         vector<NewNode> nodes(1);
 
         // Initialize new node.
-        c->client.putnodes_prepareOneFolder(&nodes[0], "d");
+        c.client.putnodes_prepareOneFolder(&nodes[0], "d");
 
         // Get our hands on the sync root.
-        auto* root = c->drillchildnodebyname(c->gettestbasenode(), "s");
+        auto* root = c.drillchildnodebyname(c.gettestbasenode(), "s");
         ASSERT_TRUE(root);
 
         // Create new node in the cloud.
-        ASSERT_TRUE(c->putnodes(root->nodeHandle(), NoVersioning, std::move(nodes)));
+        ASSERT_TRUE(c.putnodes(root->nodeHandle(), NoVersioning, std::move(nodes)));
     }
 
     // Add and start sync.
-    const auto id = c->setupSync_mainthread("s", "s", false, false);
+    const auto id = c.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
-    const auto SYNCROOT = c->syncSet(id).localpath;
+    const auto SYNCROOT = c.syncSet(id).localpath;
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Confirm /d has made it to disk.
     Model model;
 
     model.addfolder("d");
 
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Trigger a filesystem notification.
     model.addfile("d/f", "x");
 
     ASSERT_TRUE(createDataFile(SYNCROOT / "d" / "f", "x"));
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Confirm /d/f made it to the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 }
 
 TEST_F(SyncTest, FilesystemWatchesPresentAfterResume)
@@ -8068,21 +7432,19 @@ TEST_F(SyncTest, MoveTargetHasFilesystemWatch)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = chrono::seconds(4);
 
-    auto c = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c(TESTROOT, "c");
 
     // Log callbacks.
-    c->logcb = true;
+    c.logcb = true;
 
     // Log in client.
-    ASSERT_TRUE(c->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(c));
+    ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Set up sync.
-    const auto id = c->setupSync_mainthread("s", "s", false, false);
+    const auto id = c.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
-    const auto SYNCROOT = c->syncSet(id).localpath;
+    const auto SYNCROOT = c.syncSet(id).localpath;
 
     // Build model and populate filesystem.
     Model model;
@@ -8092,25 +7454,13 @@ TEST_F(SyncTest, MoveTargetHasFilesystemWatch)
     model.addfolder("d2/dx");
     model.generate(SYNCROOT);
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for initial sync to complete.
-    waitonsyncs(TIMEOUT, c);
-
-    // Wait for everything to reach the cloud.
-    {
-        auto *root = c->gettestbasenode();
-        ASSERT_NE(root, nullptr);
-
-        root = c->drillchildnodebyname(root, "s");
-        ASSERT_NE(root, nullptr);
-
-        auto predicate = SyncRemoteMatch(*root, model.root.get());
-        ASSERT_TRUE(c->waitFor(std::move(predicate), DEFAULTWAIT));
-    }
+    waitonsyncs(TIMEOUT, &c);
 
     // Confirm directories have hit the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Local move.
     {
@@ -8127,13 +7477,13 @@ TEST_F(SyncTest, MoveTargetHasFilesystemWatch)
                    SYNCROOT / "d1" / "dx");
     }
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Make sure movement has propagated to the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Trigger some filesystem notifications.
     model.addfile("d1/dq/fq", "q");
@@ -8142,16 +7492,16 @@ TEST_F(SyncTest, MoveTargetHasFilesystemWatch)
     ASSERT_TRUE(createDataFile(SYNCROOT / "d1" / "dq" / "fq", "q"));
     ASSERT_TRUE(createDataFile(SYNCROOT / "d1" / "dx" / "fx", "x"));
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Have the files made it up to the cloud?
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // So we can detect whether we've received packets for the below.
-    c->received_node_actionpackets = false;
+    c.received_node_actionpackets = false;
 
     // Remotely move.
     {
@@ -8172,13 +7522,13 @@ TEST_F(SyncTest, MoveTargetHasFilesystemWatch)
     }
 
     // Wait for the client to receive action packets for the above change.
-    ASSERT_TRUE(c->waitForNodesUpdated(30));
+    ASSERT_TRUE(c.waitForNodesUpdated(30));
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Make sure movements occured on disk.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Trigger some filesystem notifications.
     model.removenode("d2/dq/fq");
@@ -8187,13 +7537,13 @@ TEST_F(SyncTest, MoveTargetHasFilesystemWatch)
     fs::remove(SYNCROOT / "d2" / "dq" / "fq");
     fs::remove(SYNCROOT / "d0" / "dx" / "fx");
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Make sure removes propagated to the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 }
 
 // TODO: re-enable after sync rework is merged
@@ -8265,21 +7615,19 @@ TEST_F(SyncTest, RenameReplaceSourceAndTargetHaveFilesystemWatch)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT = chrono::seconds(8);
 
-    auto c = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c(TESTROOT, "c");
 
     // Log callbacks.
-    c->logcb = true;
+    c.logcb = true;
 
     // Log in client.
-    ASSERT_TRUE(c->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(c));
+    ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Add and start sync.
-    const auto id = c->setupSync_mainthread("s", "s", false, false);
+    const auto id = c.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
-    const auto SYNCROOT = c->syncSet(id).localpath;
+    const auto SYNCROOT = c.syncSet(id).localpath;
 
     // Build model and populate filesystem.
     Model model;
@@ -8288,13 +7636,13 @@ TEST_F(SyncTest, RenameReplaceSourceAndTargetHaveFilesystemWatch)
     model.addfolder("dz");
     model.generate(SYNCROOT);
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for initial sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Make sure directories have made it to the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Rename /dq -> /dr (ascending), replace /dq.
     model.addfolder("dr");
@@ -8308,13 +7656,13 @@ TEST_F(SyncTest, RenameReplaceSourceAndTargetHaveFilesystemWatch)
     fs::rename(SYNCROOT / "dz", SYNCROOT / "dy");
     fs::create_directories(SYNCROOT / "dz");
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Make sure moves made it to the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Make sure rename targets still receive notifications.
     model.addfile("dr/fr", "r");
@@ -8323,13 +7671,13 @@ TEST_F(SyncTest, RenameReplaceSourceAndTargetHaveFilesystemWatch)
     ASSERT_TRUE(createDataFile(SYNCROOT / "dr" / "fr", "r"));
     ASSERT_TRUE(createDataFile(SYNCROOT / "dy" / "fy", "y"));
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Did the files make it to the cloud?
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Make sure (now replaced) rename sources still receive notifications.
     model.addfile("dq/fq", "q");
@@ -8340,13 +7688,13 @@ TEST_F(SyncTest, RenameReplaceSourceAndTargetHaveFilesystemWatch)
     ASSERT_TRUE(createDataFile(SYNCROOT / "dq" / "fq", "q"));
     ASSERT_TRUE(createDataFile(SYNCROOT / "dz" / "fz", "z"));
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Did the files make it to the cloud?
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 }
 
 TEST_F(SyncTest, RenameTargetHasFilesystemWatch)
@@ -8354,21 +7702,19 @@ TEST_F(SyncTest, RenameTargetHasFilesystemWatch)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT = chrono::seconds(4);
 
-    StandardClientInUse c = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c(TESTROOT, "c");
 
     // Log callbacks.
-    c->logcb = true;
+    c.logcb = true;
 
     // Log in client.
-    ASSERT_TRUE(c->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(c));
+    ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Add and start sync.
-    const auto id = c->setupSync_mainthread("s", "s", false, false);
+    const auto id = c.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
-    const auto SYNCROOT = c->syncSet(id).localpath;
+    const auto SYNCROOT = c.syncSet(id).localpath;
 
     // Build model and populate filesystem.
     Model model;
@@ -8377,13 +7723,13 @@ TEST_F(SyncTest, RenameTargetHasFilesystemWatch)
     model.addfolder("dz");
     model.generate(SYNCROOT);
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Confirm model.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Locally rename.
     {
@@ -8400,13 +7746,13 @@ TEST_F(SyncTest, RenameTargetHasFilesystemWatch)
         fs::rename(SYNCROOT / "dz", SYNCROOT / "dy");
     }
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Make sure rename has hit the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Make sure rename targets receive notifications.
     model.addfile("dr/f", "x");
@@ -8415,50 +7761,53 @@ TEST_F(SyncTest, RenameTargetHasFilesystemWatch)
     ASSERT_TRUE(createDataFile(SYNCROOT / "dr" / "f", "x"));
     ASSERT_TRUE(createDataFile(SYNCROOT / "dy" / "f", "y"));
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Check file has made it to the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
     // Remotely rename.
     {
-        StandardClientInUse cr = g_clientManager->getCleanStandardClient(0, TESTROOT);
+        StandardClient cr(TESTROOT, "cc");
 
-        auto* root = cr->gettestbasenode();
+        // Log in client.
+        ASSERT_TRUE(cr.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+
+        auto* root = cr.gettestbasenode();
         ASSERT_TRUE(root);
 
         // dr -> ds (ascending.)
         model.removenode("dr");
         model.addfile("ds/f", "x");
 
-        auto* dr = cr->drillchildnodebyname(root, "s/dr");
+        auto* dr = cr.drillchildnodebyname(root, "s/dr");
         ASSERT_TRUE(dr);
 
-        ASSERT_TRUE(cr->setattr(dr, attr_map('n', "ds")));
+        ASSERT_TRUE(cr.setattr(dr, attr_map('n', "ds")));
 
         // dy -> dx (descending.)
         model.removenode("dy");
         model.addfile("dx/f", "y");
 
-        auto* dy = cr->drillchildnodebyname(root, "s/dy");
+        auto* dy = cr.drillchildnodebyname(root, "s/dy");
         ASSERT_TRUE(dy);
 
-        ASSERT_TRUE(cr->setattr(dy, attr_map('n', "dx")));
+        ASSERT_TRUE(cr.setattr(dy, attr_map('n', "dx")));
     }
 
     // it can take a while for APs to arrive (or to be sent)
     WaitMillisec(4000);
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Confirm move has occured locally.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 
-    c->received_node_actionpackets = false;
+    c.received_node_actionpackets = false;
 
     // Check that /ds and /dx receive notifications.
     model.removenode("ds/f");
@@ -8466,15 +7815,15 @@ TEST_F(SyncTest, RenameTargetHasFilesystemWatch)
     fs::remove(SYNCROOT / "ds" / "f");
     fs::remove(SYNCROOT / "dx" / "f");
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
-    ASSERT_TRUE(c->waitForNodesUpdated(30)) << " no actionpacket received in c";
+    ASSERT_TRUE(c.waitForNodesUpdated(30)) << " no actionpacket received in c";
 
     // Wait for synchronization to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Confirm remove has hit the cloud.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 }
 
 TEST_F(SyncTest, RootHasFilesystemWatch)
@@ -8482,37 +7831,35 @@ TEST_F(SyncTest, RootHasFilesystemWatch)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse c = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c(TESTROOT, "c");
 
     // Log callbacks.
-    c->logcb = true;
+    c.logcb = true;
 
-    // Log in client.
-    ASSERT_TRUE(c->resetBaseFolderMulticlient());
-    ASSERT_TRUE(c->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(c));
+    // Log in client and clear remote contents.
+    ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Set up sync
-    const auto id = c->setupSync_mainthread("s", "s", false, false);
+    const auto id = c.setupSync_mainthread("s", "s", false, false);
     ASSERT_NE(id, UNDEF);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Trigger some filesystem notifications.
     Model model;
 
     model.addfolder("d0");
     model.addfile("f0");
-    model.generate(c->syncSet(id).localpath);
+    model.generate(c.syncSet(id).localpath);
 
-    c->triggerPeriodicScanEarly(id);
+    c.triggerPeriodicScanEarly(id);
 
     // Wait for sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Confirm models.
-    ASSERT_TRUE(c->confirmModel_mainthread(model.root.get(), id));
+    ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 }
 
 struct TwoWaySyncSymmetryCase
@@ -8706,7 +8053,7 @@ struct TwoWaySyncSymmetryCase
             auto* from = client.drillchildnodebyname(root, "initial");
             ASSERT_NE(from, nullptr);
 
-            ASSERT_TRUE(client.copy(from, root, name()));
+            ASSERT_TRUE(client.cloudCopyTreeAs(from, root, name()));
         }
 
         // Prepare Local Filesystem
@@ -8807,24 +8154,37 @@ struct TwoWaySyncSymmetryCase
         return nullptr;
     }
 
+    handle BackupAdd(const string& drivePath, const string& sourcePath, const string& targetPath, const string& logname)
+    {
+        return client1().backupAdd_mainthread(drivePath, sourcePath, targetPath, logname);
+    }
+
+    handle SetupSync(const string& sourcePath, const string& targetPath, bool uploadIgnoreFirst = true)
+    {
+        return client1().setupSync_mainthread(sourcePath, targetPath, isBackup(), uploadIgnoreFirst);
+    }
+
     void SetupTwoWaySync()
     {
         ASSERT_NE(remoteSyncRoot(), nullptr);
 
         string basePath   = client1().fsBasePath.u8string();
-        string drivePath  = string(1, '\0');
+        string drivePath  = localTestBasePath().u8string();
         string sourcePath = localSyncRootPath().u8string();
         string targetPath = remoteSyncRootPath();
 
-        if (isExternalBackup())
-        {
-            drivePath = localTestBasePath().u8string();
-            drivePath.erase(0, basePath.size() + 1);
-        }
-
+        drivePath.erase(0, basePath.size() + 1);
         sourcePath.erase(0, basePath.size() + 1);
 
-        backupId = client1().setupSync_mainthread(sourcePath, targetPath, isBackup(), false, drivePath);
+        if (isExternalBackup())
+        {
+            backupId = BackupAdd(drivePath, sourcePath, targetPath, "");
+        }
+        else
+        {
+            backupId = SetupSync(sourcePath, targetPath, false);
+        }
+
         ASSERT_NE(backupId, UNDEF);
 
         if (Sync* sync = client1().syncByBackupId(backupId))
@@ -9375,7 +8735,8 @@ struct TwoWaySyncSymmetryCase
     {
         Sync* sync = client1().syncByBackupId(backupId);
 
-        std::function<void()> printTrees = [&]() {
+        if (printTreesBeforeAndAfter)
+        {
             out() << " ---- local filesystem after sync of change ----";
             PrintLocalTree(fs::path(localTestBasePath()));
 
@@ -9393,19 +8754,9 @@ struct TwoWaySyncSymmetryCase
             }
             out() << " ---- expected sync destination (model) ----";
             PrintModelTree(destinationModel().findnode("f"));
-        };
-
-        if (printTreesBeforeAndAfter)
-        {
-            printTrees();
-
-            // Don't saturate the logs if we're already displaying the trees.
-            printTrees = nullptr;
         }
 
         out() << "Checking twoway sync "<< name();
-
-        auto confirmedOk = true;
 
         if (shouldDisableSync())
         {
@@ -9416,10 +8767,9 @@ struct TwoWaySyncSymmetryCase
             EXPECT_TRUE(lfs) << "Couldn't confirm LFS: " << name();
             EXPECT_TRUE(rnt) << "Couldn't confirm RNT: " << name();
 
-            confirmedOk &= lfs && rnt;
-
             finalResult = sync == nullptr;
-            finalResult &= confirmedOk;
+            finalResult &= lfs;
+            finalResult &= rnt;
         }
         else
         {
@@ -9433,17 +8783,9 @@ struct TwoWaySyncSymmetryCase
             EXPECT_EQ(localnode, remote);
             EXPECT_TRUE(localfs && localnode && remote) << " failed in " << name();
 
-            confirmedOk &= localfs && localnode && remote;
-
-            finalResult = sync && sync->state() == SYNC_ACTIVE;
-            finalResult &= confirmedOk;
+            finalResult = localfs && localnode && remote && sync && sync->state() == SYNC_ACTIVE;
         }
 
-        // Show the trees if there's been a mismatch.
-        if (printTrees && !confirmedOk)
-        {
-            printTrees();
-        }
     }
 };
 
@@ -9500,7 +8842,11 @@ void PrepareForSync(StandardClient& client)
 bool WaitForRemoteMatch(map<string, TwoWaySyncSymmetryCase>& testcases,
                         chrono::seconds timeout)
 {
-    auto check = [&]() {
+    auto total = std::chrono::milliseconds(0);
+    constexpr auto sleepIncrement = std::chrono::milliseconds(500);
+
+    do
+    {
         auto i = testcases.begin();
         auto j = testcases.end();
 
@@ -9516,24 +8862,12 @@ bool WaitForRemoteMatch(map<string, TwoWaySyncSymmetryCase>& testcases,
 
             if (!client.match(id, model.findnode("f")))
             {
-                out() << "Cloud/model misatch: "
-                      << client.client.clientname
-                      << ": "
-                      << testcase.name();
-
-                return false;
+                out() << "Cloud/model misatch: " << testcase.name();
+                break;
             }
         }
 
-        return true;
-    };
-
-    auto total = std::chrono::milliseconds(0);
-    constexpr auto sleepIncrement = std::chrono::milliseconds(500);
-
-    do
-    {
-        if (check())
+        if (i == j)
         {
             out() << "Cloud/model matched.";
             return true;
@@ -9546,13 +8880,9 @@ bool WaitForRemoteMatch(map<string, TwoWaySyncSymmetryCase>& testcases,
     }
     while (total < timeout);
 
-    if (!check())
-    {
-        out() << "Timed out waiting for cloud/model match.";
-        return false;
-    }
+    out() << "Timed out waiting for cloud/model match.";
 
-    return true;
+    return false;
 }
 
 TEST_F(SyncTest, TwoWay_Highlevel_Symmetries)
@@ -9765,7 +9095,7 @@ TEST_F(SyncTest, TwoWay_Highlevel_Symmetries)
     ASSERT_EQ(clientA1Resume.basefolderhandle, clientA2.basefolderhandle);
 
     // wait for normal sync resumes to complete
-    clientA1Resume.waitFor([&](StandardClient& sc) { return sc.received_syncs_restored; }, std::chrono::seconds(30));
+    clientA1Resume.waitFor([&](StandardClient& sc){ return sc.received_syncs_restored; }, std::chrono::seconds(30));
 
     // now resume remainder - some are external syncs
     int resumed = 0;
@@ -9834,7 +9164,6 @@ TEST_F(SyncTest, MoveExistingIntoNewDirectoryWhilePaused)
     // Initial setup.
     {
         StandardClient c(TESTROOT, "c");
-        // don't use clientManager as we re-use the client "c" for its directory
 
         // Log in client.
         ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
@@ -9898,49 +9227,70 @@ TEST_F(SyncTest, MoveExistingIntoNewDirectoryWhilePaused)
     ASSERT_TRUE(c.confirmModel_mainthread(model.root.get(), id));
 }
 
+// Useful predicates.
+const auto SyncDisabled = [](handle id) {
+    return [id](StandardClient& client) {
+        return client.syncByBackupId(id) == nullptr;
+    };
+};
+
+const auto SyncMonitoring = [](handle id) {
+    return [id](StandardClient& client) {
+        const auto* sync = client.syncByBackupId(id);
+        return sync && sync->isBackupMonitoring();
+    };
+};
+
 TEST_F(SyncTest, ForeignChangesInTheCloudDisablesMonitoringBackup)
 {
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse c = g_clientManager->getCleanStandardClient(0, TESTROOT);
-    StandardClientInUse cu = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient c(TESTROOT, "c");
+
     // Log callbacks.
-    c->logcb = true;
-    cu->logcb = true;
-    ASSERT_TRUE(cu->resetBaseFolderMulticlient(c));
-    ASSERT_TRUE(c->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cu, c));
+    c.logcb = true;
+
+    // Log in client.
+    ASSERT_TRUE(c.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Add and start sync.
-    const auto id = c->setupSync_mainthread("s", "s", true, false);
+    const auto id = c.setupSync_mainthread("s", "s", true, false);
     ASSERT_NE(id, UNDEF);
 
     // Wait for initial sync to complete.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Make sure we're in monitoring mode.
-    ASSERT_TRUE(c->waitFor(SyncMonitoring(id), TIMEOUT));
+    ASSERT_TRUE(c.waitFor(SyncMonitoring(id), TIMEOUT));
 
     // Make a (foreign) change to the cloud.
     {
+        StandardClient cu(TESTROOT, "cu");
+
+        // Log callbacks.
+        cu.logcb = true;
+
+        // Log in client.
+        ASSERT_TRUE(cu.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
+
         // Create a directory.
         vector<NewNode> node(1);
 
-        cu->client.putnodes_prepareOneFolder(&node[0], "d");
+        cu.client.putnodes_prepareOneFolder(&node[0], "d");
 
-        ASSERT_TRUE(cu->putnodes(c->syncSet(id).h, NoVersioning, std::move(node)));
+        ASSERT_TRUE(cu.putnodes(c.syncSet(id).h, NoVersioning, std::move(node)));
     }
 
     // Give our sync some time to process remote changes.
-    waitonsyncs(TIMEOUT, c);
+    waitonsyncs(TIMEOUT, &c);
 
     // Wait for the sync to be disabled.
-    ASSERT_TRUE(c->waitFor(SyncDisabled(id), TIMEOUT));
+    ASSERT_TRUE(c.waitFor(SyncDisabled(id), TIMEOUT));
 
     // Has the sync failed?
     {
-        SyncConfig config = c->syncConfigByBackupID(id);
+        SyncConfig config = c.syncConfigByBackupID(id);
 
         ASSERT_EQ(config.mBackupState, SYNC_BACKUP_MONITOR);
         ASSERT_EQ(config.mEnabled, false);
@@ -9973,7 +9323,7 @@ public:
 TEST_F(SyncTest, MonitoringExternalBackupRestoresInMirroringMode)
 {
     const auto TESTROOT = makeNewTestRoot();
-    const auto TIMEOUT  = chrono::seconds(8);
+    const auto TIMEOUT  = chrono::seconds(4);
 
     // Model.
     Model m;
@@ -9989,8 +9339,6 @@ TEST_F(SyncTest, MonitoringExternalBackupRestoresInMirroringMode)
 
     {
         StandardClient cb(TESTROOT, "cb");
-        // can not use ClientManager as both these clients must refer to their filesystem as "cb"
-        // even though there are two of them
 
         // Log callbacks.
         cb.logcb = true;
@@ -10004,14 +9352,22 @@ TEST_F(SyncTest, MonitoringExternalBackupRestoresInMirroringMode)
         m.generate(cb.fsBasePath / "s");
 
         // Add and start sync.
-        id = cb.setupSync_mainthread("s", "s", true, true, "");
-        ASSERT_NE(id, UNDEF);
+        {
+            // Generate drive ID.
+            auto driveID = generateDriveId(cb.client.rng);
+
+            // Write drive ID.
+            auto drivePath = cb.fsBasePath.u8string();
+            auto result = writeDriveId(*cb.client.fsaccess, drivePath.c_str(), driveID);
+            ASSERT_EQ(result, API_OK);
+
+            // Add sync.
+            id = cb.backupAdd_mainthread("", "s", "s", "");
+            ASSERT_NE(id, UNDEF);
+        }
 
         // Wait for sync to complete.
         waitonsyncs(TIMEOUT, &cb);
-
-        // Give the engine some time to actually upload the files.
-        ASSERT_TRUE(cb.waitFor(SyncRemoteMatch("s", m.root.get()), TIMEOUT));
 
         // Make sure everything made it to the cloud.
         ASSERT_TRUE(cb.confirmModel_mainthread(m.root.get(), id));
@@ -10063,42 +9419,53 @@ TEST_F(SyncTest, MonitoringExternalBackupResumesInMirroringMode)
     const auto TESTROOT = makeNewTestRoot();
     const auto TIMEOUT  = chrono::seconds(4);
 
-    StandardClientInUse cb = g_clientManager->getCleanStandardClient(0, TESTROOT);
+    StandardClient cb(TESTROOT, "cb");
 
     // Log callbacks.
-    cb->logcb = true;
+    cb.logcb = true;
 
     // Log in client.
-    ASSERT_TRUE(cb->resetBaseFolderMulticlient());
-    ASSERT_TRUE(cb->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cb));
+    ASSERT_TRUE(cb.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Create some files to be synchronized.
     Model m;
 
     m.addfile("d/f");
     m.addfile("f");
-    m.generate(cb->fsBasePath / "s");
+    m.generate(cb.fsBasePath / "s");
 
     // Add and start sync.
-    auto id = cb->setupSync_mainthread("s", "s", true, true, "");
-    ASSERT_NE(id, UNDEF);
+    auto id = UNDEF;
+
+    {
+        // Generate drive ID.
+        auto driveID = generateDriveId(cb.client.rng);
+
+        // Write drive ID.
+        auto drivePath = cb.fsBasePath.u8string();
+        auto result = writeDriveId(*cb.client.fsaccess, drivePath.c_str(), driveID);
+        ASSERT_EQ(result, API_OK);
+
+        // Add sync.
+        id = cb.backupAdd_mainthread("", "s", "s", "");
+        ASSERT_NE(id, UNDEF);
+    }
 
     // Wait for the mirror to complete.
-    waitonsyncs(TIMEOUT, cb);
+    waitonsyncs(TIMEOUT, &cb);
 
     // Make sure everything arrived safe and sound.
-    ASSERT_TRUE(cb->confirmModel_mainthread(m.root.get(), id));
+    ASSERT_TRUE(cb.confirmModel_mainthread(m.root.get(), id));
 
     // Wait for transition to monitoring mode.
-    ASSERT_TRUE(cb->waitFor(SyncMonitoring(id), TIMEOUT));
+    ASSERT_TRUE(cb.waitFor(SyncMonitoring(id), TIMEOUT));
 
     // Disable the sync.
-    ASSERT_TRUE(cb->disableSync(id, NO_SYNC_ERROR, true));
+    ASSERT_TRUE(cb.disableSync(id, NO_SYNC_ERROR, true));
 
     // Make sure the sync's config is as we expect.
     {
-        auto config = cb->syncConfigByBackupID(id);
+        auto config = cb.syncConfigByBackupID(id);
 
         // Backup should remain in monitoring mode.
         ASSERT_EQ(config.mBackupState, SYNC_BACKUP_MONITOR);
@@ -10112,20 +9479,20 @@ TEST_F(SyncTest, MonitoringExternalBackupResumesInMirroringMode)
     {
         vector<NewNode> node(1);
 
-        cb->client.putnodes_prepareOneFolder(&node[0], "g");
+        cb.client.putnodes_prepareOneFolder(&node[0], "g");
 
-        auto rootHandle = cb->syncSet(id).h;
-        ASSERT_TRUE(cb->putnodes(rootHandle, NoVersioning, std::move(node)));
+        auto rootHandle = cb.syncSet(id).h;
+        ASSERT_TRUE(cb.putnodes(rootHandle, NoVersioning, std::move(node)));
     }
 
     // Re-enable the sync.
-    ASSERT_TRUE(cb->enableSyncByBackupId(id, ""));
+    ASSERT_TRUE(cb.enableSyncByBackupId(id, ""));
 
     // Wait for the mirror to complete.
-    waitonsyncs(TIMEOUT, cb);
+    waitonsyncs(TIMEOUT, &cb);
 
     // Cloud should mirror the disk.
-    ASSERT_TRUE(cb->confirmModel_mainthread(m.root.get(), id));
+    ASSERT_TRUE(cb.confirmModel_mainthread(m.root.get(), id));
 }
 
 TEST_F(SyncTest, MirroringInternalBackupResumesInMirroringMode)
@@ -10142,24 +9509,21 @@ TEST_F(SyncTest, MirroringInternalBackupResumesInMirroringMode)
     // Sync Root Handle.
     NodeHandle rootHandle;
 
+    // "Foreign" client.
+    StandardClient cf(TESTROOT, "cf");
+
     // Model.
     Model m;
 
-    StandardClientInUse cf = g_clientManager->getCleanStandardClient(0, TESTROOT);
-
     // Log callbacks.
-    cf->logcb = true;
+    cf.logcb = true;
 
-    // Log in client.
-    ASSERT_TRUE(cf->resetBaseFolderMulticlient());
-    ASSERT_TRUE(cf->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cf));
+    // Log client in.
+    ASSERT_TRUE(cf.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Check manual resume.
     {
         BackupClient cb(TESTROOT, "cb");
-        // can not use ClientManager as is a BackupClient and
-        // "cb" is re-used later
 
         // Log callbacks.
         cb.logcb = true;
@@ -10225,9 +9589,9 @@ TEST_F(SyncTest, MirroringInternalBackupResumesInMirroringMode)
         // Make some changes to the cloud.
         vector<NewNode> node(1);
 
-        cf->client.putnodes_prepareOneFolder(&node[0], "g");
+        cf.client.putnodes_prepareOneFolder(&node[0], "g");
 
-        ASSERT_TRUE(cf->putnodes(rootHandle, NoVersioning, std::move(node)));
+        ASSERT_TRUE(cf.putnodes(rootHandle, NoVersioning, std::move(node)));
 
         // Log out the client when we try and upload a file.
         std::promise<void> waiter;
@@ -10267,10 +9631,10 @@ TEST_F(SyncTest, MirroringInternalBackupResumesInMirroringMode)
     {
         vector<NewNode> nodes(2);
 
-        cf->client.putnodes_prepareOneFolder(&nodes[0], "h0");
-        cf->client.putnodes_prepareOneFolder(&nodes[1], "h1");
+        cf.client.putnodes_prepareOneFolder(&nodes[0], "h0");
+        cf.client.putnodes_prepareOneFolder(&nodes[1], "h1");
 
-        ASSERT_TRUE(cf->putnodes(rootHandle, NoVersioning, std::move(nodes)));
+        ASSERT_TRUE(cf.putnodes(rootHandle, NoVersioning, std::move(nodes)));
     }
 
     // Check automatic resume.
@@ -10319,23 +9683,21 @@ TEST_F(SyncTest, MonitoringInternalBackupResumesInMonitoringMode)
     // Session ID.
     string sessionID;
 
+    // "Foreign" client.
+    StandardClient cf(TESTROOT, "cf");
+
     // Model.
     Model m;
 
-    StandardClientInUse cf = g_clientManager->getCleanStandardClient(0, TESTROOT);
-
     // Log callbacks.
-    cf->logcb = true;
+    cf.logcb = true;
 
-    // Log in client.
-    ASSERT_TRUE(cf->resetBaseFolderMulticlient());
-    ASSERT_TRUE(cf->makeCloudSubdirs("s", 0, 0));
-    ASSERT_TRUE(CatchupClients(cf));
+    // Log foreign client in.
+    ASSERT_TRUE(cf.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Manual resume.
     {
         StandardClient cb(TESTROOT, "cb");
-        // can not use ClientManager as we re-use "cb" (in filesystem) later
 
         // Log callbacks.
         cb.logcb = true;
@@ -10379,9 +9741,9 @@ TEST_F(SyncTest, MonitoringInternalBackupResumesInMonitoringMode)
         {
             vector<NewNode> node(1);
 
-            cf->client.putnodes_prepareOneFolder(&node[0], "g");
+            cf.client.putnodes_prepareOneFolder(&node[0], "g");
 
-            ASSERT_TRUE(cf->putnodes(rootHandle, NoVersioning, std::move(node)));
+            ASSERT_TRUE(cf.putnodes(rootHandle, NoVersioning, std::move(node)));
         }
 
         // Enable the backup.
@@ -10423,9 +9785,9 @@ TEST_F(SyncTest, MonitoringInternalBackupResumesInMonitoringMode)
     {
         vector<NewNode> node(1);
 
-        cf->client.putnodes_prepareOneFolder(&node[0], "h");
+        cf.client.putnodes_prepareOneFolder(&node[0], "h");
 
-        ASSERT_TRUE(cf->putnodes(rootHandle, NoVersioning, std::move(node)));
+        ASSERT_TRUE(cf.putnodes(rootHandle, NoVersioning, std::move(node)));
     }
 
     // Automatic resume.
@@ -10496,7 +9858,7 @@ void BackupBehavior::doTest(const string& initialContent,
     ASSERT_TRUE(cu.login_reset_makeremotenodes("MEGA_EMAIL", "MEGA_PWD", "s", 0, 0));
 
     // Add and start a backup sync.
-    const auto idU = cu.setupSync_mainthread("su", "s", true, true);
+    const auto idU = cu.setupSync_mainthread("su", "s", true);
     ASSERT_NE(idU, UNDEF);
 
     // Add a file for the engine to synchronize.
@@ -10560,7 +9922,7 @@ void BackupBehavior::doTest(const string& initialContent,
         ASSERT_TRUE(cd.login_fetchnodes("MEGA_EMAIL", "MEGA_PWD"));
 
         // Add and start a new sync.
-        auto idD = cd.setupSync_mainthread("sd", "s", false, true);
+        auto idD = cd.setupSync_mainthread("sd", "s");
         ASSERT_NE(idD, UNDEF);
 
         // Wait for the sync to complete.
@@ -10601,7 +9963,6 @@ TEST_F(SyncTest, UndecryptableSharesBehavior)
     const auto TESTROOT = makeNewTestRoot();
 
     StandardClient client0(TESTROOT, "client0");
-    // can not use ClientManager as we re-login later
     StandardClient client1(TESTROOT, "client1");
     StandardClient client2(TESTROOT, "client2");
 
@@ -10675,45 +10036,45 @@ TEST_F(SyncTest, UndecryptableSharesBehavior)
         ASSERT_TRUE(client0.uploadFilesInTree(sPath, r));
     }
 
-    NodeHandle sh;
-
     // Get our hands on the remote sync root.
-    {
-        Node* s = client0.drillchildnodebyname(r, "s");
-        ASSERT_NE(s, nullptr);
-
-        sh = s->nodeHandle();
-    }
+    Node* s = client0.drillchildnodebyname(r, "s");
+    ASSERT_NE(s, nullptr);
 
     // Share the test root with client 1.
     ASSERT_TRUE(client0.share(*r, getenv("MEGA_EMAIL_AUX"), FULL));
-    ASSERT_TRUE(client1.waitFor(SyncRemoteNodePresent(*r), std::chrono::seconds(90)));
+    ASSERT_TRUE(client1.waitFor(SyncRemoteNodePresent(*r), DEFAULTWAIT));
 
     // Share the sync root with client 2.
-    ASSERT_TRUE(client0.share(sh, getenv("MEGA_EMAIL_AUX2"), FULL));
-    ASSERT_TRUE(client2.waitFor(SyncRemoteNodePresent(sh), std::chrono::seconds(90)));
+    ASSERT_TRUE(client0.share(*s, getenv("MEGA_EMAIL_AUX2"), FULL));
+    ASSERT_TRUE(client2.waitFor(SyncRemoteNodePresent(*s), DEFAULTWAIT));
 
     // Add and start a new sync.
     auto id = UNDEF;
 
-    // Add the sync.
-    id = client1.setupSync_mainthread("s", sh, false, false);
-    ASSERT_NE(id, UNDEF);
+    {
+        // View s from client 1's perspective.
+        auto* xs = client1.client.nodebyhandle(s->nodehandle);
+        ASSERT_NE(xs, nullptr);
+
+        // Add the sync.
+        id = client1.setupSync_mainthread("s", *xs, false, false);
+        ASSERT_NE(id, UNDEF);
+    }
 
     // Wait for the initial sync to complete.
     waitonsyncs(DEFAULTWAIT, &client1);
 
     // Make sure the clients all agree with what's in the cloud.
     ASSERT_TRUE(client1.confirmModel_mainthread(model.root.get(), id));
-    ASSERT_TRUE(client2.waitFor(SyncRemoteMatch(sh, model.root.get()), DEFAULTWAIT));
+    ASSERT_TRUE(client2.waitFor(SyncRemoteMatch(*s, model.root.get()), DEFAULTWAIT));
 
     // Log out the sharing client so that it doesn't maintain keys.
-    ASSERT_TRUE(client0.logout(false));
+    client0.logout(false);
 
     // Make a couple changes to client1's sync via client2.
     {
         // Nodes from client2's perspective.
-        auto* xs = client2.client.nodeByHandle(sh);
+        auto* xs = client2.client.nodebyhandle(s->nodehandle);
         ASSERT_NE(xs, nullptr);
 
         auto* xt = client2.client.childnodebyname(xs, "t");
@@ -10744,7 +10105,7 @@ TEST_F(SyncTest, UndecryptableSharesBehavior)
 
         // Be certain that client 1 can see w.
         ASSERT_TRUE(client1.waitFor(SyncRemoteNodePresent(*xw), DEFAULTWAIT));
-
+        
         // Let the engine try and process the change.
         waitonsyncs(DEFAULTWAIT, &client1);
 
@@ -10754,21 +10115,21 @@ TEST_F(SyncTest, UndecryptableSharesBehavior)
         model.movenode("t", "w");
 
         ASSERT_TRUE(client2.movenode(xt->nodehandle, xw->nodehandle));
-        ASSERT_TRUE(client1.waitForNodesUpdated(50));
+        ASSERT_TRUE(client1.waitForNodesUpdated(30));
 
         client1.received_node_actionpackets = false;
 
         model.movenode("u", "w");
 
         ASSERT_TRUE(client2.movenode(xu->nodehandle, xw->nodehandle));
-        ASSERT_TRUE(client1.waitForNodesUpdated(50));
+        ASSERT_TRUE(client1.waitForNodesUpdated(30));
 
         client1.received_node_actionpackets = false;
 
         model.movenode("v", "w");
 
         ASSERT_TRUE(client2.movenode(xv->nodehandle, xw->nodehandle));
-        ASSERT_TRUE(client1.waitForNodesUpdated(50));
+        ASSERT_TRUE(client1.waitForNodesUpdated(30));
     }
 
     // Wait for client 1 to stall (due to undecryptable nodes.)

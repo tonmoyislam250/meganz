@@ -162,7 +162,7 @@ typedef uint32_t dstime;
 #define TOSTRING(x) STRINGIFY(x)
 
 // HttpReq states
-typedef enum { REQ_READY, REQ_GET_URL, REQ_PREPARED, REQ_UPLOAD_PREPARED_BUT_WAIT,
+typedef enum { REQ_READY, REQ_PREPARED, REQ_UPLOAD_PREPARED_BUT_WAIT,
                REQ_ENCRYPTING, REQ_DECRYPTING, REQ_DECRYPTED,
                REQ_INFLIGHT,
                REQ_SUCCESS, REQ_FAILURE, REQ_DONE, REQ_ASYNCIO,
@@ -214,7 +214,6 @@ typedef enum ErrorCodes : int
     API_EMASTERONLY = -27,          ///< Access denied for sub-users (only for business accounts)
     API_EBUSINESSPASTDUE = -28,     ///< Business account expired
     API_EPAYWALL = -29,             ///< Over Disk Quota Paywall
-    LOCAL_ENOSPC = -1000,           ///< Insufficient space
 } error;
 
 class Error
@@ -337,19 +336,12 @@ typedef uint16_t fatype;
 typedef list<struct File*> file_list;
 
 // node types:
-typedef enum {
-
-    // these first two are for sync rework, and should not be used before that branch is merged (directoyScan is from sync rework)
-    TYPE_DONOTSYNC = -3,
-    TYPE_SPECIAL = -2,
-
-    TYPE_UNKNOWN = -1,
-    FILENODE = 0,    // FILE - regular file nodes
-    FOLDERNODE,      // FOLDER - regular folder nodes
-    ROOTNODE,        // ROOT - the cloud drive root node
-    INCOMINGNODE,    // INCOMING - inbox
-    RUBBISHNODE      // RUBBISH - rubbish bin
-} nodetype_t;
+// FILE - regular file nodes
+// FOLDER - regular folder nodes
+// ROOT - the cloud drive root node
+// INCOMING - inbox
+// RUBBISH - rubbish bin
+typedef enum { TYPE_UNKNOWN = -1, FILENODE = 0, FOLDERNODE, ROOTNODE, INCOMINGNODE, RUBBISHNODE } nodetype_t;
 
 typedef enum { LBL_UNKNOWN = 0, LBL_RED = 1, LBL_ORANGE = 2, LBL_YELLOW = 3, LBL_GREEN = 4,
                LBL_BLUE = 5, LBL_PURPLE = 6, LBL_GREY = 7, } nodelabel_t;
@@ -358,8 +350,6 @@ typedef enum { LBL_UNKNOWN = 0, LBL_RED = 1, LBL_ORANGE = 2, LBL_YELLOW = 3, LBL
 const int FILENODEKEYLENGTH = 32;
 const int FOLDERNODEKEYLENGTH = 16;
 
-// Max nodes per putnodes command
-const unsigned MAXNODESUPLOAD = 1000;
 typedef union {
     std::array<byte, FILENODEKEYLENGTH> bytes;
     struct {
@@ -437,14 +427,6 @@ typedef enum
     SYNC_BACKUP_MONITOR = 2
 }
 SyncBackupState;
-
-enum ScanResult
-{
-    SCAN_INPROGRESS,
-    SCAN_SUCCESS,
-    SCAN_FSID_MISMATCH,
-    SCAN_INACCESSIBLE
-}; // ScanResult
 
 enum SyncError {
     NO_SYNC_ERROR = 0,
@@ -575,18 +557,6 @@ public:
     void insert(iterator i, T t)                         { applyErase(); mDeque.insert(i, E(t)); }
     T& operator[](size_t n)                              { applyErase(); return mDeque[n]; }
 
-};
-
-template <class T1, class T2> class mapWithLookupExisting : public map<T1, T2>
-{
-    typedef map<T1, T2> base; // helps older gcc
-public:
-    T2* lookupExisting(T1 key)
-    {
-        auto it = base::find(key);
-        if (it == base::end()) return nullptr;
-        return &it->second;
-    }
 };
 
 // map a request tag with pending dbids of transfers and files
@@ -736,6 +706,65 @@ typedef enum {
 
 typedef enum { AES_MODE_UNKNOWN, AES_MODE_CCM, AES_MODE_GCM } encryptionmode_t;
 
+#ifdef ENABLE_CHAT
+typedef enum { PRIV_UNKNOWN = -2, PRIV_RM = -1, PRIV_RO = 0, PRIV_STANDARD = 2, PRIV_MODERATOR = 3 } privilege_t;
+typedef pair<handle, privilege_t> userpriv_pair;
+typedef vector< userpriv_pair > userpriv_vector;
+typedef map <handle, set <handle> > attachments_map;
+struct TextChat : public Cacheable
+{
+    enum {
+        FLAG_OFFSET_ARCHIVE = 0
+    };
+
+    handle id;
+    privilege_t priv;
+    int shard;
+    userpriv_vector *userpriv;
+    bool group;
+    string title;        // byte array
+    string unifiedKey;   // byte array
+    handle ou;
+    m_time_t ts;     // creation time
+    attachments_map attachedNodes;
+    bool publicchat;  // whether the chat is public or private
+    bool meeting;     // chat is meeting room
+
+private:        // use setter to modify these members
+    byte flags;     // currently only used for "archive" flag at first bit
+
+public:
+    int tag;    // source tag, to identify own changes
+
+    TextChat();
+    ~TextChat();
+
+    bool serialize(string *d);
+    static TextChat* unserialize(class MegaClient *client, string *d);
+
+    void setTag(int tag);
+    int getTag();
+    void resetTag();
+
+    struct
+    {
+        bool attachments : 1;
+        bool flags : 1;
+        bool mode : 1;
+    } changed;
+
+    // return false if failed
+    bool setNodeUserAccess(handle h, handle uh, bool revoke = false);
+    bool setFlag(bool value, uint8_t offset = 0xFF);
+    bool setFlags(byte newFlags);
+    bool isFlagSet(uint8_t offset) const;
+    bool setMode(bool publicchat);
+
+};
+typedef vector<TextChat*> textchat_vector;
+typedef map<handle, TextChat*> textchat_map;
+#endif
+
 typedef enum { RECOVER_WITH_MASTERKEY = 9, RECOVER_WITHOUT_MASTERKEY = 10, CANCEL_ACCOUNT = 21, CHANGE_EMAIL = 12 } recovery_t;
 
 typedef enum { EMAIL_REMOVED = 0, EMAIL_PENDING_REMOVED = 1, EMAIL_PENDING_ADDED = 2, EMAIL_FULLY_ACCEPTED = 3 } emailstatus_t;
@@ -762,8 +791,7 @@ enum SmsVerificationState {
 
 typedef enum
 {
-    END_CALL_REASON_REJECTED     = 0x02,    /// 1on1 call was rejected while ringing
-    END_CALL_REASON_BY_MODERATOR = 0x06,    /// group or meeting call has been ended by moderator
+    END_CALL_REASON_REJECTED    = 0x02,    /// 1on1 call was rejected while ringing
 } endCall_t;
 
 typedef unsigned int achievement_class_id;
@@ -838,22 +866,18 @@ namespace CodeCounter
         uint64_t starts = 0;
         uint64_t finishes = 0;
         high_resolution_clock::duration timeSpent{};
-        high_resolution_clock::duration longest{};
         std::string name;
         ScopeStats(std::string s) : name(std::move(s)) {}
 
         inline string report(bool reset = false)
         {
-            string s = " " + name + ": " + std::to_string(count) + " " +
-                    std::to_string(duration_cast<milliseconds>(timeSpent).count()) + " " +
-                    std::to_string(duration_cast<milliseconds>(longest).count());
+            string s = " " + name + ": " + std::to_string(count) + " " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(timeSpent).count());
             if (reset)
             {
                 count = 0;
                 starts -= finishes;
                 finishes = 0;
                 timeSpent = high_resolution_clock::duration{};
-                longest = high_resolution_clock::duration{};
             }
             return s;
         }
@@ -888,7 +912,6 @@ namespace CodeCounter
 #ifdef MEGA_MEASURE_CODE
         ScopeStats& scope;
         high_resolution_clock::time_point blockStart;
-        high_resolution_clock::duration diff{};
         bool done = false;
 
         ScopeTimer(ScopeStats& sm) : scope(sm), blockStart(high_resolution_clock::now())
@@ -897,7 +920,7 @@ namespace CodeCounter
         }
         ~ScopeTimer()
         {
-            complete();
+            if (!done) complete();
         }
         high_resolution_clock::duration timeSpent()
         {
@@ -905,16 +928,10 @@ namespace CodeCounter
         }
         void complete()
         {
-            // can be called early in which case the destructor's call is ignored
-            if (!done)
-            {
-                ++scope.count;
-                ++scope.finishes;
-                diff = high_resolution_clock::now() - blockStart;
-                scope.timeSpent += diff;
-                if (diff > scope.longest) scope.longest = diff;
-                done = true;
-            }
+            ++scope.count;
+            ++scope.finishes;
+            scope.timeSpent += timeSpent();
+            done = true;
         }
 #else
         ScopeTimer(ScopeStats& sm) {}
@@ -1044,62 +1061,6 @@ public:
     // only allow move if the pointers are null (check at runtime with assert)
     crossref_ptr(crossref_ptr&& p) { assert(!p.ptr); }
     void operator=(crossref_ptr&& p) { assert(!p.ptr); ptr = p; }
-};
-
-class CancelToken
-{
-    // A small item with representation shared between many objects
-    // They can all be cancelled in one go by setting the token flag true
-    shared_ptr<bool> flag;
-
-public:
-
-    // invalid token, can't be cancelled.  No storage
-    CancelToken() {}
-
-    // create with a token available to be cancelled
-    explicit CancelToken(bool value)
-        : flag(std::make_shared<bool>(value))
-    {
-        if (value)
-        {
-            ++tokensCancelledCount;
-        }
-    }
-
-    void cancel()
-    {
-        if (flag)
-        {
-            *flag = true;
-            ++tokensCancelledCount;
-        }
-    }
-
-    bool isCancelled() const
-    {
-        return !!flag && *flag;
-    }
-
-    bool exists()
-    {
-        return !!flag;
-    }
-
-    static std::atomic<uint32_t> tokensCancelledCount;
-
-    static bool haveAnyCancelsOccurredSince(uint32_t& lastKnownCancelCount)
-    {
-        if (lastKnownCancelCount == tokensCancelledCount.load())
-        {
-            return false;
-        }
-        else
-        {
-            lastKnownCancelCount = tokensCancelledCount.load();
-            return true;
-        }
-    }
 };
 
 } // namespace

@@ -415,19 +415,12 @@ void SymmCipher::setint64(int64_t value, byte* data)
 
 void SymmCipher::xorblock(const byte* src, byte* dst)
 {
-    if (((ptrdiff_t)src & (sizeof(long)-1)) == 0 && ((ptrdiff_t)dst & (sizeof(long)-1)) == 0) 
+    long* lsrc = (long*)src;
+    long* ldst = (long*)dst;
+
+    for (int i = BLOCKSIZE / sizeof(long); i--;)
     {
-        // src and dst aligned to machine word
-        long* lsrc = (long*)src;
-        long* ldst = (long*)dst;
-        for (int i = BLOCKSIZE / sizeof(long); i--;)
-        {
-            ldst[i] ^= lsrc[i];
-        }
-    }
-    else 
-    {
-        xorblock(src, dst, BLOCKSIZE);
+        ldst[i] ^= lsrc[i];
     }
 }
 
@@ -654,7 +647,6 @@ int AsymmCipher::decrypt(const byte* cipher, size_t cipherlen, byte* out, size_t
 int AsymmCipher::setkey(int numints, const byte* data, int len)
 {
     int ret = decodeintarray(key, numints, data, len);
-    if (numints == PRIVKEY && ret && !isvalid(numints)) return 0;
     padding = (numints == PUBKEY && ret) ? (len - key[PUB_PQ].ByteCount() - key[PUB_E].ByteCount() - 4) : 0;
     return ret;
 }
@@ -777,12 +769,10 @@ int AsymmCipher::isvalid(int keytype)
 
     if (keytype == PRIVKEY)
     {
-        // detect private key blob corruption - prevent API-exploitable RSA oracle requiring 500+ logins
-        return key[PRIV_P].BitCount() > 1000 &&
-                key[PRIV_Q].BitCount() > 1000 &&
-                key[PRIV_D].BitCount() > 2000 &&
-                key[PRIV_U].BitCount() > 1000 &&
-                key[PRIV_U] == key[PRIV_P].InverseMod(key[PRIV_Q]);
+        return key[PRIV_P].BitCount() &&
+                key[PRIV_Q].BitCount() &&
+                key[PRIV_D].BitCount() &&
+                key[PRIV_U].BitCount();
     }
 
     return 0;

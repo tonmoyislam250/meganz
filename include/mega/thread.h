@@ -31,7 +31,6 @@ class Thread
 public:
     virtual void start(void *(*start_routine)(void*), void *parameter) = 0;
     virtual void join() = 0;
-    virtual bool isCurrentThread() = 0;
 };
 
 class Semaphore

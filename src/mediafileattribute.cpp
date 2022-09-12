@@ -219,20 +219,14 @@ void MediaFileInfo::onCodecMappingsReceipt(MegaClient* client, int codecListVers
         ++i;   // the call below may remove this item from the map
 
         // indicate that file attribute 8 can be retrieved now, allowing the transfer to complete
-        if (auto uploadFAPtr = client->fileAttributesUploading.lookupExisting(th))
-        {
-            if (auto faPtr = uploadFAPtr->pendingfa.lookupExisting(fatype(fa_media)))
-            {
-                faPtr->valueIsSet = true;
-            }
-        }
+        client->pendingfa[pair<UploadHandle, fatype>(th, fatype(fa_media))] = pair<handle, int>(0, 0);
         client->checkfacompletion(th);
     }
 
     client->app->mediadetection_ready();
 }
 
-unsigned MediaFileInfo::queueMediaPropertiesFileAttributesForUpload(MediaProperties& vp, uint32_t fakey[4], MegaClient* client, UploadHandle uploadHandle, Transfer* transfer)
+unsigned MediaFileInfo::queueMediaPropertiesFileAttributesForUpload(MediaProperties& vp, uint32_t fakey[4], MegaClient* client, UploadHandle uploadHandle)
 {
     if (mediaCodecsFailed)
     {
@@ -246,9 +240,11 @@ unsigned MediaFileInfo::queueMediaPropertiesFileAttributesForUpload(MediaPropert
     uploadFileAttributes[uploadHandle] = q;
     LOG_debug << "Media attribute enqueued for upload";
 
-    // indicate we have this attribute.  If we have the codec mappings, it can be encoded.  If not, hold the transfer until we do have it
-    client->fileAttributesUploading.setFileAttributePending(uploadHandle, fatype(fa_media), transfer, mediaCodecsReceived);
-
+    if (mediaCodecsReceived)
+    {
+        // indicate we have this attribute ready to go. Otherwise the transfer will be put on hold till we can
+        client->pendingfa[pair<UploadHandle, fatype>(uploadHandle, fatype(fa_media))] = pair<handle, int>(0, 0);
+    }
     return 1;
 }
 

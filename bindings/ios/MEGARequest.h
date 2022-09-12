@@ -30,7 +30,6 @@
 #import "MEGABannerList.h"
 #import "MEGAHandleList.h"
 #import "MEGACurrency.h"
-#import "MEGARecentActionBucket.h"
 
 typedef NS_ENUM (NSInteger, MEGARequestType) {
     MEGARequestTypeLogin,
@@ -172,11 +171,6 @@ typedef NS_ENUM (NSInteger, MEGARequestType) {
     MEGARequestTypeFetchGoogleAds,
     MEGARequestTypeQueryGoogleAds,
     MEGARequestTypeGetAttrNode,
-    MEGARequestTypeLoadExternalDriveBackups,
-    MEGARequestTypeCloseExternalDriveBackups,
-    MEGARequestTypeGetDownloadUrls,
-    MEGARequestTypeExecuteOnThread,
-    MEGARequestTypeGetRecentActions,
     TotalOfRequestTypes
 };
 
@@ -564,16 +558,6 @@ typedef NS_ENUM (NSInteger, MEGANodeAccessLevel) {
  *
  */
 @property (readonly, nonatomic) NSArray<NSNumber *> *megaHandleArray;
-
-/// Array of recent actions buckets
-/// 
-/// This value is valid for these requests:
-///
-/// - [MEGASdk getRecentActionsAsyncSinceDays:maxNodes:delegate:]
-/// 
-/// - [MEGASdk getRecentActionsAsyncSinceDays:maxNodes:]
-/// 
-@property (readonly, nonatomic) NSArray<MEGARecentActionBucket *> *recentActionsBuckets;
 
 /**
  * @brief Creates a copy of this MEGARequest object

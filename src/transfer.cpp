@@ -29,7 +29,6 @@
 #include "mega/mediafileattribute.h"
 #include "megawaiter.h"
 #include "mega/utils.h"
-#include "mega/testhooks.h"
 
 namespace mega {
 
@@ -65,6 +64,7 @@ Transfer::Transfer(MegaClient* cclient, direction_t ctype)
     client = cclient;
     size = 0;
     failcount = 0;
+    minfa = 0;
     pos = 0;
     ctriv = 0;
     metamac = 0;
@@ -81,19 +81,16 @@ Transfer::Transfer(MegaClient* cclient, direction_t ctype)
 
     skipserialization = false;
 
+    faputcompletion_it = client->faputcompletion.end();
     transfers_it = client->transfers[type].end();
 }
 
 // delete transfer with underlying slot, notify files
 Transfer::~Transfer()
 {
-    TransferDbCommitter* committer = client->tctable ?
-                         static_cast<TransferDbCommitter*>(client->tctable->getTransactionCommitter()) :
-                         nullptr;
-
-    if (!uploadhandle.isUndef())
+    if (faputcompletion_it != client->faputcompletion.end())
     {
-        client->fileAttributesUploading.erase(uploadhandle);
+        client->faputcompletion.erase(faputcompletion_it);
     }
 
     for (file_list::iterator it = files.begin(); it != files.end(); it++)
@@ -135,7 +132,7 @@ Transfer::~Transfer()
         {
             client->fsaccess->unlinklocal(localfilename);
         }
-        client->transfercachedel(this, committer);
+        client->transfercachedel(this, nullptr);
     }
 }
 
@@ -384,20 +381,7 @@ SymmCipher *Transfer::transfercipher()
     return client->getRecycledTemporaryTransferCipher(transferkey.data());
 }
 
-void Transfer::removeCancelledTransferFiles(TransferDbCommitter* committer)
-{
-    // remove transfer files whose MegaTransfer associated has been cancelled (via cancel token)
-    for (file_list::iterator it = files.begin(); it != files.end();)
-    {
-        file_list::iterator auxit = it++;
-        if ((*auxit)->cancelToken.isCancelled())
-        {
-            removeTransferFile(API_EINCOMPLETE, *auxit, committer);
-        }
-    }
-}
-
-void Transfer::removeTransferFile(error e, File* f, TransferDbCommitter* committer)
+void Transfer::removeTransferFile(error e, File* f, DBTableTransactionCommitter* committer)
 {
     Transfer *transfer = f->transfer;
     client->filecachedel(f, committer);
@@ -408,26 +392,13 @@ void Transfer::removeTransferFile(error e, File* f, TransferDbCommitter* committ
     f->terminated(e);
 }
 
-void Transfer::removeAndDeleteSelf(transferstate_t finalState)
-{
-    finished = true;
-    state = finalState;
-    client->app->transfer_removed(this);
-
-    // this will also remove the transfer from internal lists etc.
-    // those use a lazy delete (ie mark for later deletion) so that we don't invalidate iterators.
-    delete this;
-}
-
 // transfer attempt failed, notify all related files, collect request on
 // whether to abort the transfer, kill transfer if unanimous
-void Transfer::failed(const Error& e, TransferDbCommitter& committer, dstime timeleft)
+void Transfer::failed(const Error& e, DBTableTransactionCommitter& committer, dstime timeleft)
 {
     bool defer = false;
 
     LOG_debug << "Transfer failed with error " << e;
-
-    DEBUG_TEST_HOOK_DOWNLOAD_FAILED(e);
 
     if (e == API_EOVERQUOTA || e == API_EPAYWALL)
     {
@@ -622,7 +593,7 @@ void Transfer::addAnyMissingMediaFileAttributes(Node* node, /*const*/ LocalPath&
 
             if (type == PUT)
             {
-                client->mediaFileInfo.queueMediaPropertiesFileAttributesForUpload(vp, attrKey, client, uploadhandle, this);
+                minfa += client->mediaFileInfo.queueMediaPropertiesFileAttributesForUpload(vp, attrKey, client, uploadhandle);
             }
             else
             {
@@ -635,7 +606,7 @@ void Transfer::addAnyMissingMediaFileAttributes(Node* node, /*const*/ LocalPath&
 
 // transfer completion: copy received file locally, set timestamp(s), verify
 // fingerprint, notify app, notify files
-void Transfer::complete(TransferDbCommitter& committer)
+void Transfer::complete(DBTableTransactionCommitter& committer)
 {
     CodeCounter::ScopeTimer ccst(client->performanceStats.transferComplete);
 
@@ -1014,7 +985,7 @@ void Transfer::complete(TransferDbCommitter& committer)
             slot->retrybt.backoff(11);
         }
     }
-    else // type == PUT
+    else
     {
         LOG_debug << client->clientname << "Upload complete: " << (files.size() ? files.front()->name : "NO_FILES") << " " << files.size();
 
@@ -1113,7 +1084,7 @@ void Transfer::complete(TransferDbCommitter& committer)
         }
 
         // if this transfer is put on hold, do not complete
-        client->checkfacompletion(uploadhandle, this, true);
+        client->checkfacompletion(uploadhandle, this);
         return;
     }
 }
@@ -1648,7 +1619,7 @@ TransferList::TransferList()
     currentpriority = PRIORITY_START;
 }
 
-void TransferList::addtransfer(Transfer *transfer, TransferDbCommitter& committer, bool startFirst)
+void TransferList::addtransfer(Transfer *transfer, DBTableTransactionCommitter& committer, bool startFirst)
 {
     if (transfer->state != TRANSFERSTATE_PAUSED)
     {
@@ -1693,7 +1664,7 @@ void TransferList::removetransfer(Transfer *transfer)
     }
 }
 
-void TransferList::movetransfer(Transfer *transfer, Transfer *prevTransfer, TransferDbCommitter& committer)
+void TransferList::movetransfer(Transfer *transfer, Transfer *prevTransfer, DBTableTransactionCommitter& committer)
 {
     transfer_list::iterator dstit;
     if (getIterator(prevTransfer, dstit))
@@ -1702,7 +1673,7 @@ void TransferList::movetransfer(Transfer *transfer, Transfer *prevTransfer, Tran
     }
 }
 
-void TransferList::movetransfer(Transfer *transfer, unsigned int position, TransferDbCommitter& committer)
+void TransferList::movetransfer(Transfer *transfer, unsigned int position, DBTableTransactionCommitter& committer)
 {
     transfer_list::iterator dstit;
     if (position >= transfers[transfer->type].size())
@@ -1721,7 +1692,7 @@ void TransferList::movetransfer(Transfer *transfer, unsigned int position, Trans
     }
 }
 
-void TransferList::movetransfer(Transfer *transfer, transfer_list::iterator dstit, TransferDbCommitter& committer)
+void TransferList::movetransfer(Transfer *transfer, transfer_list::iterator dstit, DBTableTransactionCommitter& committer)
 {
     transfer_list::iterator it;
     if (getIterator(transfer, it))
@@ -1730,7 +1701,7 @@ void TransferList::movetransfer(Transfer *transfer, transfer_list::iterator dsti
     }
 }
 
-void TransferList::movetransfer(transfer_list::iterator it, transfer_list::iterator dstit, TransferDbCommitter& committer)
+void TransferList::movetransfer(transfer_list::iterator it, transfer_list::iterator dstit, DBTableTransactionCommitter& committer)
 {
     if (it == dstit)
     {
@@ -1818,29 +1789,29 @@ void TransferList::movetransfer(transfer_list::iterator it, transfer_list::itera
     client->app->transfer_update(transfer);
 }
 
-void TransferList::movetofirst(Transfer *transfer, TransferDbCommitter& committer)
+void TransferList::movetofirst(Transfer *transfer, DBTableTransactionCommitter& committer)
 {
     movetransfer(transfer, transfers[transfer->type].begin(), committer);
 }
 
-void TransferList::movetofirst(transfer_list::iterator it, TransferDbCommitter& committer)
+void TransferList::movetofirst(transfer_list::iterator it, DBTableTransactionCommitter& committer)
 {
     Transfer *transfer = (*it);
     movetransfer(it, transfers[transfer->type].begin(), committer);
 }
 
-void TransferList::movetolast(Transfer *transfer, TransferDbCommitter& committer)
+void TransferList::movetolast(Transfer *transfer, DBTableTransactionCommitter& committer)
 {
     movetransfer(transfer, transfers[transfer->type].end(), committer);
 }
 
-void TransferList::movetolast(transfer_list::iterator it, TransferDbCommitter& committer)
+void TransferList::movetolast(transfer_list::iterator it, DBTableTransactionCommitter& committer)
 {
     Transfer *transfer = (*it);
     movetransfer(it, transfers[transfer->type].end(), committer);
 }
 
-void TransferList::moveup(Transfer *transfer, TransferDbCommitter& committer)
+void TransferList::moveup(Transfer *transfer, DBTableTransactionCommitter& committer)
 {
     transfer_list::iterator it;
     if (getIterator(transfer, it))
@@ -1854,7 +1825,7 @@ void TransferList::moveup(Transfer *transfer, TransferDbCommitter& committer)
     }
 }
 
-void TransferList::moveup(transfer_list::iterator it, TransferDbCommitter& committer)
+void TransferList::moveup(transfer_list::iterator it, DBTableTransactionCommitter& committer)
 {
     if (it == transfers[it->transfer->type].begin())
     {
@@ -1865,7 +1836,7 @@ void TransferList::moveup(transfer_list::iterator it, TransferDbCommitter& commi
     movetransfer(it, dstit, committer);
 }
 
-void TransferList::movedown(Transfer *transfer, TransferDbCommitter& committer)
+void TransferList::movedown(Transfer *transfer, DBTableTransactionCommitter& committer)
 {
     transfer_list::iterator it;
     if (getIterator(transfer, it))
@@ -1882,7 +1853,7 @@ void TransferList::movedown(Transfer *transfer, TransferDbCommitter& committer)
     }
 }
 
-void TransferList::movedown(transfer_list::iterator it, TransferDbCommitter& committer)
+void TransferList::movedown(transfer_list::iterator it, DBTableTransactionCommitter& committer)
 {
     if (it == transfers[it->transfer->type].end())
     {
@@ -1893,7 +1864,7 @@ void TransferList::movedown(transfer_list::iterator it, TransferDbCommitter& com
     movetransfer(it, dstit, committer);
 }
 
-error TransferList::pause(Transfer *transfer, bool enable, TransferDbCommitter& committer)
+error TransferList::pause(Transfer *transfer, bool enable, DBTableTransactionCommitter& committer)
 {
     if (!transfer)
     {
@@ -1979,8 +1950,7 @@ bool TransferList::getIterator(Transfer *transfer, transfer_list::iterator& it, 
 }
 
 std::array<vector<Transfer*>, 6> TransferList::nexttransfers(std::function<bool(Transfer*)>& continuefunction,
-                                                             std::function<bool(direction_t)>& directionContinuefunction,
-                                                             TransferDbCommitter& committer)
+                                                             std::function<bool(direction_t)>& directionContinuefunction)
 {
     std::array<vector<Transfer*>, 6> chosenTransfers;
 
@@ -1990,17 +1960,6 @@ std::array<vector<Transfer*>, 6> TransferList::nexttransfers(std::function<bool(
     {
         for (Transfer *transfer : transfers[direction])
         {
-            if (!transfer->slot)
-            {
-                // check for cancellation here before we go to the trouble of requesting a download/upload URL
-                transfer->removeCancelledTransferFiles(&committer);
-                if (transfer->files.empty())
-                {
-                    transfer->removeAndDeleteSelf(TRANSFERSTATE_CANCELLED);
-                    continue;
-                }
-            }
-
             // don't traverse the whole list if we already have as many as we are going to get
             if (!directionContinuefunction(direction)) break;
 
@@ -2048,7 +2007,7 @@ Transfer *TransferList::transferat(direction_t direction, unsigned int position)
     return NULL;
 }
 
-void TransferList::prepareIncreasePriority(Transfer *transfer, transfer_list::iterator /*srcit*/, transfer_list::iterator dstit, TransferDbCommitter& committer)
+void TransferList::prepareIncreasePriority(Transfer *transfer, transfer_list::iterator /*srcit*/, transfer_list::iterator dstit, DBTableTransactionCommitter& committer)
 {
     assert(transfer->type == PUT || transfer->type == GET);
     if (dstit == transfers[transfer->type].end())

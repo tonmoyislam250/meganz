@@ -27,7 +27,6 @@
 #include "account.h"
 #include "http.h"
 #include "json.h"
-#include "textchat.h"
 
 namespace mega {
 
@@ -498,16 +497,12 @@ public:
 
 class MEGA_API CommandLogout : public Command
 {
-public:
-    using Completion = std::function<void(error)>;
+    bool mKeepSyncConfigsFile;
 
+public:
     bool procresult(Result) override;
 
-    CommandLogout(MegaClient* client, Completion completion, bool keepSyncConfigsFile);
-
-private:
-    Completion mCompletion;
-    bool mKeepSyncConfigsFile;
+    CommandLogout(MegaClient*, bool keepSyncConfigsFile);
 };
 
 class MEGA_API CommandPubKeyRequest : public Command

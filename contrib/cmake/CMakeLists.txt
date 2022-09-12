@@ -119,17 +119,6 @@ if (WIN32)
         message(STATUS "CMAKE_CXX_COMPILER ${CMAKE_CXX_COMPILER}")
         message(FATAL_ERROR "Can't tell if we should build 32 bit or 64 bit")
     endif()
-elseif(APPLE AND NOT IOS)
-    set (build_64_bit 1)
-
-    if (CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64"))
-        set(build_arm64 1)
-        message("Building for macOS arm64 in a ${CMAKE_HOST_SYSTEM_PROCESSOR} host.")
-    else()
-        set(build_arm64 0)
-        message("Building for macOS x86_64 in a ${CMAKE_HOST_SYSTEM_PROCESSOR} host.")
-    endif()
-
 else()
     set (build_64_bit 1 CACHE STRING "Build for a 64 bit target")
     message(STATUS "Building 64 bit")
@@ -226,19 +215,18 @@ if (USE_THIRDPARTY_FROM_VCPKG) #vcpkg or system
                     set(VCPKG_TRIPLET "x86-windows-mega" CACHE STRING "")
                 endif(build_64_bit)
             endif()
-        ELSEIF(CMAKE_HOST_APPLE)
-            if(NOT IOS)
-                if(build_arm64)
-                    set(VCPKG_TRIPLET "arm64-osx-mega" CACHE STRING "")
-                else()
+
+        ELSE(WIN32)
+             IF(CMAKE_HOST_APPLE)
+                if(NOT IOS)
                     set(VCPKG_TRIPLET "x64-osx-mega" CACHE STRING "")
+                else()
+                    set(VCPKG_TRIPLET "arm64-ios" CACHE STRING "")
                 endif()
-            else()
-                set(VCPKG_TRIPLET "arm64-ios" CACHE STRING "")
-            endif()
-        ELSE()
-            set(VCPKG_TRIPLET "x64-linux" CACHE STRING "")
-        ENDIF()
+            ELSE(CMAKE_HOST_APPLE)
+                set(VCPKG_TRIPLET "x64-linux" CACHE STRING "")
+            endif(CMAKE_HOST_APPLE)
+        ENDIF(WIN32)
     endif()
 
 
@@ -733,7 +721,6 @@ add_library(Mega STATIC
             ${MegaDir}/include/mega/http.h
             ${MegaDir}/include/mega/useralerts.h
             ${MegaDir}/include/mega/pendingcontactrequest.h
-            ${MegaDir}/include/mega/textchat.h
             ${MegaDir}/include/mega/megaapp.h
             ${MegaDir}/include/mega/wincurl/megafs.h
             ${MegaDir}/include/mega/wincurl/meganet.h
@@ -823,7 +810,6 @@ add_library(Mega STATIC
             ${MegaDir}/src/megaclient.cpp
             ${MegaDir}/src/node.cpp
             ${MegaDir}/src/pendingcontactrequest.cpp
-            ${MegaDir}/src/textchat.cpp
             ${MegaDir}/src/proxy.cpp
             ${MegaDir}/src/pubkeyaction.cpp
             ${MegaDir}/src/raid.cpp
@@ -1139,9 +1125,6 @@ else()
     if (ENABLE_WERROR)
         if (CMAKE_BUILD_TYPE STREQUAL "Debug" )
             set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
-            if (APPLE)
-              set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-sign-conversion -Wno-overloaded-virtual -Wno-inconsistent-missing-override -Wno-unused-variable -Wno-unused-private-field -Wno-string-conversion -Wno-unused-lambda-capture -Wno-implicit-int-conversion -Wno-shorten-64-to-32 -Wno-unused-value")
-            endif()
         endif()
         message(STATUS, "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
         message(STATUS, "CMAKE_CXX_FLAGS_DEBUG: ${CMAKE_CXX_FLAGS_DEBUG}")

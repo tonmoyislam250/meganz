@@ -51,7 +51,6 @@ public:
     PosixThread();
     void start(void *(*start_routine)(void*), void *parameter);
     void join();
-    bool isCurrentThread();
     virtual ~PosixThread();
 
     static unsigned long long currentThreadId();

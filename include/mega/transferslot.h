@@ -44,7 +44,7 @@ public:
     inline operator FileAccess* () { return fa.get(); }
 };
 
-class TransferDbCommitter;
+class DBTableTransactionCommitter;
 
 // active transfer
 struct MEGA_API TransferSlot
@@ -107,7 +107,7 @@ struct MEGA_API TransferSlot
     AsyncIOContext** asyncIO;
 
     // handle I/O for this slot
-    void doio(MegaClient*, TransferDbCommitter&);
+    void doio(MegaClient*, DBTableTransactionCommitter&);
 
     // helper for doio to delay connection creation until we know if it's raid or non-raid
     bool createconnectionsonce();
@@ -140,7 +140,7 @@ struct MEGA_API TransferSlot
 
 private:
     void toggleport(HttpReqXfer* req);
-    bool checkDownloadTransferFinished(TransferDbCommitter& committer, MegaClient* client);
+    bool checkDownloadTransferFinished(DBTableTransactionCommitter& committer, MegaClient* client);
     bool checkMetaMacWithMissingLateEntries();
     bool tryRaidRecoveryFromHttpGetError(unsigned i, bool incrementErrors);
 

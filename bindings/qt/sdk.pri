@@ -62,7 +62,6 @@ SOURCES += src/attrmap.cpp \
     src/waiterbase.cpp  \
     src/proxy.cpp \
     src/pendingcontactrequest.cpp \
-    src/textchat.cpp \
     src/crypto/cryptopp.cpp  \
     src/crypto/sodium.cpp  \
     src/db/sqlite.cpp  \
@@ -152,11 +151,6 @@ CONFIG(USE_CONSOLE) {
         SOURCES += src/posix/console.cpp
         SOURCES += src/posix/consolewaiter.cpp
         LIBS += -lreadline
-        macx:vcpkg{
-            debug:LIBS += $$THIRDPARTY_VCPKG_PATH/debug/lib/libhistory.a
-            !debug:LIBS += $$THIRDPARTY_VCPKG_PATH/lib/libhistory.a
-            LIBS += -ltermcap
-        }
     }
 }
 
@@ -247,7 +241,7 @@ CONFIG(USE_LIBRAW) {
     vcpkg:win32:LIBS += -ljpeg
     vcpkg:!win32:LIBS += -ljpeg
     vcpkg:unix:!macx:LIBS += -lgomp
-    vcpkg:!CONFIG(USE_PDFIUM):LIBS += -llcms$$DEBUG_SUFFIX
+    vcpkg:!CONFIG(USE_PDFIUM):LIBS += -llcms2$$DEBUG_SUFFIX
 
     win32 {
         DEFINES += LIBRAW_NODLL
@@ -497,7 +491,6 @@ HEADERS  += include/mega.h \
             include/mega/waiter.h \
             include/mega/proxy.h \
             include/mega/pendingcontactrequest.h \
-            include/mega/textchat.h \
             include/mega/crypto/cryptopp.h  \
             include/mega/crypto/sodium.h  \
             include/mega/db/sqlite.h  \

@@ -53,8 +53,8 @@
     return self.megaCancelToken->isCancelled();
 }
 
-- (void)cancel {
-    self.megaCancelToken->cancel();
+- (void)cancelWithNewValue:(BOOL)newValue {
+    self.megaCancelToken->cancel(newValue);
 }
 
 @end

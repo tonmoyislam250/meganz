@@ -31,7 +31,6 @@
 #import "MEGABannerList+init.h"
 #import "MEGAHandleList+init.h"
 #import "MEGACurrency+init.h"
-#import "MEGARecentActionBucket+init.h"
 
 using namespace mega;
 
@@ -260,18 +259,6 @@ using namespace mega;
         [handleArray addObject:[NSNumber numberWithUnsignedLongLong:[handleList megaHandleAtIndex:i]]];
     }
     return handleArray.copy;
-}
-
-- (NSArray *)recentActionsBuckets {
-    MegaRecentActionBucketList *megaRecentActionBucketList = self.megaRequest->getRecentActions();
-    int count = megaRecentActionBucketList->size();
-    NSMutableArray *recentActionBucketMutableArray = [NSMutableArray.alloc initWithCapacity:(NSInteger)count];
-    for (int i = 0; i < count; i++) {
-        MEGARecentActionBucket *recentActionBucket = [MEGARecentActionBucket.alloc initWithMegaRecentActionBucket:megaRecentActionBucketList->get(i)->copy() cMemoryOwn:YES];
-        [recentActionBucketMutableArray addObject:recentActionBucket];
-    }
-
-    return recentActionBucketMutableArray;
 }
 
 @end

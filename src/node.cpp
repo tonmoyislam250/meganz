@@ -860,8 +860,6 @@ string Node::displaypath() const
             path.insert(0, "//bin");
             return path;
 
-        case TYPE_DONOTSYNC:
-        case TYPE_SPECIAL:
         case TYPE_UNKNOWN:
         case FILENODE:
             path.insert(0, n->displayname());
@@ -1274,7 +1272,7 @@ void LocalNode::setnameparent(LocalNode* newparent, const LocalPath* newlocalpat
             if (!newnode && node)
             {
                 sync->client->nextreqtag(); //make reqtag advance to use the next one
-                LOG_debug << "Moving node: " << node->displaypath() << " to " << parent->node->displaypath();
+                LOG_debug << "Moving node: " << node->displayname() << " to " << parent->node->displayname();
                 if (sync->client->rename(node, parent->node, SYNCDEL_NONE, node->parent ? node->parent->nodeHandle() : NodeHandle(), nullptr, nullptr) == API_EACCESS
                         && sync != parent->sync)
                 {
@@ -1757,7 +1755,7 @@ void LocalNode::completed(Transfer* t, putsource_t source)
 
     // we are overriding completed() for sync upload, we don't use the File::completed version at all.
     assert(t->type == PUT);
-    sendPutnodes(t->client, t->uploadhandle, *t->ultoken, t->filekey, source, NodeHandle(), nullptr, this, nullptr);
+    sendPutnodes(t->client, t->uploadhandle, *t->ultoken, t->filekey, source, NodeHandle(), nullptr, this);
 }
 
 // serialize/unserialize the following LocalNode properties:

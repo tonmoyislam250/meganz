@@ -217,45 +217,16 @@ public:
 
 std::ostream& operator<<(std::ostream &os, const SCSN &scsn);
 
-struct SyncdownContext
+class SyncdownContext
 {
-    bool mBackupActionsPerformed = false;
-    bool mBackupForeignChangeDetected = false;
-}; // SyncdownContext
-
-
-// Class to help with upload of file attributes
-struct UploadWaitingForFileAttributes
-{
-    struct FileAttributeValues {
-        handle fileAttributeHandle = UNDEF;
-        bool valueIsSet = false;
-    };
-
-    mapWithLookupExisting<fatype, FileAttributeValues> pendingfa;
-
-    // The transfer must always be known, so we can check for cancellation
-    Transfer* transfer = nullptr;
-
-    // This flag is set true if its data upload completes, and we removed it from transfers[]
-    // In which case, this is now the "owning" object for the transfer
-    bool uploadCompleted = false;
-};
-
-// Class to help with upload of file attributes
-// One entry for each active upload that has file attribute involvement
-// Should the transfer be cancelled, this data structure is easily cleaned.
-struct FileAttributesPending : public mapWithLookupExisting<UploadHandle, UploadWaitingForFileAttributes>
-{
-    void setFileAttributePending(UploadHandle h, fatype type, Transfer* t, bool alreadyavailable = false)
+public:
+    SyncdownContext()
+      : mActionsPerformed(false)
     {
-        auto& entry = operator[](h);
-        entry.pendingfa[type].valueIsSet = alreadyavailable;
-        assert(entry.transfer == t || entry.transfer == nullptr);
-        entry.transfer = t;
     }
-};
 
+    bool mActionsPerformed;
+}; // SyncdownContext
 
 class MEGA_API MegaClient
 {
@@ -527,9 +498,9 @@ public:
     void removeOutSharesFromSubtree(Node* n, int tag);
 
     // start/stop/pause file transfer
-    bool startxfer(direction_t, File*, TransferDbCommitter&, bool skipdupes, bool startfirst, bool donotpersist, VersioningOption, error* cause = nullptr);
-    void stopxfer(File* f, TransferDbCommitter* committer);
-    void pausexfers(direction_t, bool pause, bool hard, TransferDbCommitter& committer);
+    bool startxfer(direction_t, File*, DBTableTransactionCommitter&, bool skipdupes, bool startfirst, bool donotpersist, VersioningOption);
+    void stopxfer(File* f, DBTableTransactionCommitter* committer);
+    void pausexfers(direction_t, bool pause, bool hard, DBTableTransactionCommitter& committer);
 
     // maximum number of connections per transfer
     static const unsigned MAX_NUM_CONNECTIONS = 6;
@@ -566,9 +537,6 @@ public:
     // helper function for preparing a putnodes call for new folders
     void putnodes_prepareOneFolder(NewNode* newnode, std::string foldername, std::function<void (AttrMap&)> addAttrs = nullptr);
 
-    // static version to be used from worker threads, which cannot rely on the MegaClient::tmpnodecipher as SymCipher (not thread-safe))
-    static void putnodes_prepareOneFolder(NewNode* newnode, std::string foldername, PrnGen& rng, SymmCipher &tmpnodecipher, std::function<void(AttrMap&)> addAttrs = nullptr);
-
     // add nodes to specified parent node (complete upload, copy files, make
     // folders)
     void putnodes(NodeHandle, VersioningOption vo, vector<NewNode>&&, const char *, int tag, CommandPutNodes::Completion&& completion = nullptr);
@@ -583,7 +551,7 @@ public:
     error getfa(handle h, string *fileattrstring, const string &nodekey, fatype, int = 0);
 
     // notify delayed upload completion subsystem about new file attribute
-    void checkfacompletion(UploadHandle, Transfer* = NULL, bool uploadCompleted = false);
+    void checkfacompletion(UploadHandle, Transfer* = NULL);
 
     // attach/update/delete a user attribute
     void putua(attr_t at, const byte* av = NULL, unsigned avl = 0, int ctag = -1, handle lastPublicHandle = UNDEF, int phtype = 0, int64_t ts = 0,
@@ -732,7 +700,7 @@ public:
     void abortlockrequest();
 
     // abort session and free all state information
-    void logout(bool keepSyncConfigsFile, CommandLogout::Completion completion = nullptr);
+    void logout(bool keepSyncConfigsFile);
 
     // free all state information
     void locallogout(bool removecaches, bool keepSyncsConfigFile);
@@ -973,9 +941,6 @@ public:
 
     // minimum bytes per second for streaming (0 == no limit, -1 == use default)
     int minstreamingrate;
-
-    // user handle for customer support user
-    static const string SUPPORT_USER_HANDLE;
 
     // root URL for chat stats
     static const string SFUSTATSURL;
@@ -1235,7 +1200,7 @@ public:
     unique_ptr<DbTable> tctable;
 
     // during processing of request responses, transfer table updates can be wrapped up in a single begin/commit
-    TransferDbCommitter* mTctableRequestCommitter = nullptr;
+    DBTableTransactionCommitter* mTctableRequestCommitter = nullptr;
 
     // status cache table for logged in user. For data pertaining status which requires immediate commits
     unique_ptr<DbTable> statusTable;
@@ -1251,12 +1216,10 @@ public:
     // have we just completed fetching new nodes?  (ie, caught up on all the historic actionpackets since the fetchnodes)
     bool statecurrent;
 
-    // File Attribute upload system.  These can come from:
-    //  - upload transfers
-    //  - app requests to attach a thumbnail/preview to a node
-    //  - app requests for media upload (which return the fa handle)
-    // initially added to queuedfa, and up to 10 moved to activefa.
+    // pending file attribute writes
     putfa_list queuedfa;
+
+    // current file attributes being sent
     putfa_list activefa;
 
     // API request queue double buffering:
@@ -1328,8 +1291,11 @@ public:
     // mapping of pending contact handles to their structure
     handlepcr_map pcrindex;
 
-    // A record of which file attributes are needed (or now available) per upload transfer
-    FileAttributesPending fileAttributesUploading;
+    // pending file attributes
+    fa_map pendingfa;
+
+    // upload waiting for file attributes
+    uploadhandletransfer_map faputcompletion;
 
     // file attribute fetch channels
     fafc_map fafcs;
@@ -1350,7 +1316,6 @@ public:
     // transfer queues (PUT/GET)
     transfer_map transfers[2];
     BackoffTimerGroupTracker transferRetryBackoffs[2];
-    uint32_t lastKnownCancelCount = 0;
 
     // transfer list to manage the priority of transfers
     TransferList transferlist;
@@ -1421,16 +1386,16 @@ public:
     void notifynode(Node*);
 
     // update transfer in the persistent cache
-    void transfercacheadd(Transfer*, TransferDbCommitter*);
+    void transfercacheadd(Transfer*, DBTableTransactionCommitter*);
 
     // remove a transfer from the persistent cache
-    void transfercachedel(Transfer*, TransferDbCommitter* committer);
+    void transfercachedel(Transfer*, DBTableTransactionCommitter* committer);
 
     // add a file to the persistent cache
-    void filecacheadd(File*, TransferDbCommitter& committer);
+    void filecacheadd(File*, DBTableTransactionCommitter& committer);
 
     // remove a file from the persistent cache
-    void filecachedel(File*, TransferDbCommitter* committer);
+    void filecachedel(File*, DBTableTransactionCommitter* committer);
 
 #ifdef ENABLE_CHAT
     textchat_map chatnotify;
@@ -1611,7 +1576,7 @@ public:
 #endif
 
     // recursively cancel transfers in a subtree
-    void stopxfers(LocalNode*, TransferDbCommitter& committer);
+    void stopxfers(LocalNode*, DBTableTransactionCommitter& committer);
 
     // update paths of all PUT transfers
     void updateputs();
@@ -1629,6 +1594,9 @@ public:
 
     // returns if the current pendingcs includes a fetch nodes command
     bool isFetchingNodesPendingCS();
+
+    // upload handle -> node handle map (filled by upload completion)
+    set<pair<UploadHandle, NodeHandle>> uhnh;
 
     // transfer chunk failed
     void setchunkfailed(string*);
@@ -1676,7 +1644,6 @@ public:
     Node* childnodebyattribute(Node*, nameid, const char*);
     static void honorPreviousVersionAttrs(Node *previousNode, AttrMap &attrs);
     vector<Node*> childnodesbyname(Node*, const char*, bool = false);
-    Node* childNodeTypeByName(Node *p, const char *name, nodetype_t type);
 
     // purge account state and abort server-client connection
     void purgenodesusersabortsc(bool keepOwnUser);
@@ -1790,9 +1757,6 @@ public:
 
     // returns the public handle of the folder link if the account is logged into a public folder, otherwise UNDEF.
     handle getFolderLinkPublicHandle();
-
-    // check if end call reason is valid
-    bool isValidEndCallReason(int reason);
 
     // check if there is a valid folder link (rootnode received and the valid key)
     bool isValidFolderLink();
@@ -1919,14 +1883,12 @@ public:
         CodeCounter::ScopeStats transferslotDoio = { "TransferSlot_doio" };
         CodeCounter::ScopeStats execdirectreads = { "execdirectreads" };
         CodeCounter::ScopeStats transferComplete = { "transfer_complete" };
-        CodeCounter::ScopeStats megaapiSendPendingTransfers = { "megaapi_sendtransfers" };
         CodeCounter::ScopeStats prepareWait = { "MegaClient_prepareWait" };
         CodeCounter::ScopeStats doWait = { "MegaClient_doWait" };
         CodeCounter::ScopeStats checkEvents = { "MegaClient_checkEvents" };
         CodeCounter::ScopeStats applyKeys = { "MegaClient_applyKeys" };
         CodeCounter::ScopeStats dispatchTransfers = { "dispatchTransfers" };
         CodeCounter::ScopeStats csResponseProcessingTime = { "cs batch response processing" };
-        CodeCounter::ScopeStats csSuccessProcessingTime = { "cs batch received processing" };
         CodeCounter::ScopeStats scProcessingTime = { "sc processing" };
         uint64_t transferStarts = 0, transferFinishes = 0;
         uint64_t transferTempErrors = 0, transferFails = 0;

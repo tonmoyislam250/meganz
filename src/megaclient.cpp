@@ -48,9 +48,6 @@ bool g_disablepkp_default = false;
 std::mutex g_APIURL_default_mutex;
 string g_APIURL_default = "https://g.api.mega.co.nz/";
 
-// user handle for customer support user
-const string MegaClient::SUPPORT_USER_HANDLE = "pGTOqu7_Fek";
-
 // root URL for chat stats
 // MegaClient statics must be const or we get threading problems
 const string MegaClient::SFUSTATSURL = "https://stats.sfu.mega.co.nz";
@@ -517,11 +514,6 @@ void MegaClient::setFolderLinkAccountAuth(const char *auth)
 handle MegaClient::getFolderLinkPublicHandle()
 {
     return mFolderLink.mPublicHandle;
-}
-
-bool MegaClient::isValidEndCallReason(int reason)
-{
-   return reason == END_CALL_REASON_REJECTED || reason == END_CALL_REASON_BY_MODERATOR;
 }
 
 bool MegaClient::isValidFolderLink()
@@ -1004,20 +996,15 @@ const Node* MegaClient::childnodebyname(const Node* p, const char* name, bool sk
     {
         if (!strcmp(nname.c_str(), (*it)->displayname()))
         {
-            if ((*it)->type == FILENODE)
+            if ((*it)->type != FILENODE && !skipfolders)
             {
-                if (skipfolders)
-                {
-                    return *it; // FOLDERs ignored, return first FILE
-                }
-                else
-                {
-                    found = *it; // FOLDERs not ignored and with precedence, save FILE in case no FOLDER is found
-                }
+                return *it;
             }
-            else if (!skipfolders)
+
+            found = *it;
+            if (skipfolders)
             {
-                return *it; // FOLDER not ignored and with precedence, return first FOLDER
+                return found;
             }
         }
     }
@@ -1103,28 +1090,6 @@ vector<Node*> MegaClient::childnodesbyname(Node* p, const char* name, bool skipf
         }
     }
 
-    return found;
-}
-
-Node* MegaClient::childNodeTypeByName(Node *p, const char *name, nodetype_t type)
-{
-    if (!name || !p || p->type == FILENODE)   // parent't can't be a file (or we're looking at versions), but could be FOLDERNODE, ROOTNODE, etc
-    {
-        return nullptr;
-    }
-
-    Node *found = nullptr;
-    string nname = name;
-    LocalPath::utf8_normalize(&nname);
-    for (node_list::iterator it = p->children.begin(); it != p->children.end(); it++)
-    {
-        // if name and node type matches
-        if (((*it)->type == type) && !strcmp(nname.c_str(), (*it)->displayname()))
-        {
-            found = *it;
-            break;
-        }
-    }
     return found;
 }
 
@@ -1588,15 +1553,10 @@ void MegaClient::exec()
         // file attribute puts (handled sequentially as a FIFO)
         if (activefa.size())
         {
-            TransferDbCommitter committer(tctable);
             putfa_list::iterator curfa = activefa.begin();
             while (curfa != activefa.end())
             {
                 HttpReqCommandPutFA* fa = *curfa;
-
-                auto erasePos = curfa;
-                ++curfa;
-
                 m_off_t p = fa->transferred(this);
                 if (fa->progressreported < p)
                 {
@@ -1622,45 +1582,57 @@ void MegaClient::exec()
                             }
                             else
                             {
+                                NodeHandle h;
+
                                 // do we have a valid upload handle?
                                 if (fa->th.isNodeHandle())
                                 {
-                                    if (Node* n = nodeByHandle(fa->th.nodeHandle()))
-                                    {
-                                        LOG_debug << "Attaching file attribute to Node";
-                                        reqs.add(new CommandAttachFA(this, n->nodehandle, fa->type, fah, fa->tag));
-                                    }
-                                    else
-                                    {
-                                        LOG_debug << "Node to attach file attribute to no longer exists";
-                                    }
+                                    // we were originally generating file attributes for an existing node
+                                    h = fa->th.nodeHandle();
                                 }
                                 else
                                 {
-                                    if (auto uploadFAPtr = fileAttributesUploading.lookupExisting(fa->th.uploadHandle()))
-                                    {
-                                        if (auto waitingFAPtr = uploadFAPtr->pendingfa.lookupExisting(fa->type))
-                                        {
-                                            waitingFAPtr->fileAttributeHandle = fah;
-                                            waitingFAPtr->valueIsSet = true;
+                                    // we were generating file attributes for an upload
+                                    // but we already completed the upload and now we need the resulting node handle
+                                    // TODO: we may have a gap here when the putnodes is already in-flight
+                                    auto it = uhnh.lower_bound(pair<UploadHandle, NodeHandle>
+                                        (fa->th.uploadHandle(), NodeHandle().setImpossibleValue(0)));
 
-                                            LOG_debug << "File attribute, type " << fa->type << " for upload handle " << fa->th << " received: " << toHandle(fah);
-                                            checkfacompletion(fa->th.uploadHandle());
-                                        }
-                                        else
-                                        {
-                                            LOG_debug << "File attribute, type " << fa->type << " for upload handle " << fa->th << " received, but that type was no longer needed";
-                                        }
+                                    if (it != uhnh.end() && it->first == fa->th.uploadHandle())
+                                    {
+                                        h = it->second;
+                                    }
+                                }
+
+                                // are we updating a live node? issue command directly.
+                                // otherwise, queue for processing upon upload
+                                // completion.
+                                if (Node* n = nodeByHandle(h))
+                                {
+                                    LOG_debug << "Attaching file attribute";
+                                    reqs.add(new CommandAttachFA(this, n->nodehandle, fa->type, fah, fa->tag));
+                                }
+                                else
+                                {
+                                    // TODO: possibly another gap here where we were generating for an existing Node, but now it's not found
+
+                                    if (fa->th.isNodeHandle())
+                                    {
+                                        LOG_warn << "Can't attach file attribute to no longer existing node";
                                     }
                                     else
                                     {
-                                        LOG_debug << "File attribute, type " << fa->type << " for upload handle " << fa->th << " received, but the upload was previously resolved";
+                                        pendingfa[pair<UploadHandle, fatype>(fa->th.uploadHandle(), fa->type)] = pair<handle, int>(fah, fa->tag);
+                                        LOG_debug << "Queueing pending file attribute. Total: " << pendingfa.size();
+                                        checkfacompletion(fa->th.uploadHandle());
                                     }
                                 }
                             }
                         }
                         else
                         {
+                            LOG_warn << "Error attaching attribute";
+
                             if (fa->th.isNodeHandle())
                             {
                                 // TODO: possibly another gap here where we were generating for an existing Node, code only dealt with the upload-in-progress case
@@ -1668,23 +1640,42 @@ void MegaClient::exec()
                             }
                             else
                             {
-                                if (auto uploadFAPtr = fileAttributesUploading.lookupExisting(fa->th.uploadHandle()))
+                                Transfer *transfer = NULL;
+                                uploadhandletransfer_map::iterator htit = faputcompletion.find(fa->th.uploadHandle());
+                                if (htit != faputcompletion.end())
                                 {
-                                    LOG_debug << "File attribute, type " << fa->type << " for upload handle " << fa->th << " failed. Discarding the need for it";
-                                    uploadFAPtr->pendingfa.erase(fa->type);
+                                    // the failed attribute belongs to a pending upload
+                                    transfer = htit->second;
                                 }
                                 else
                                 {
-                                    LOG_debug << "File attribute, type " << fa->type << " for upload handle " << fa->th << " failed, but the upload was previously resolved";
+                                    // check if the failed attribute belongs to an active upload
+                                    for (transfer_map::iterator it = transfers[PUT].begin(); it != transfers[PUT].end(); it++)
+                                    {
+                                        if (it->second->uploadhandle == fa->th.uploadHandle())
+                                        {
+                                            transfer = it->second;
+                                            break;
+                                        }
+                                    }
                                 }
 
-                                checkfacompletion(fa->th.uploadHandle());
-                                sendevent(99407,"Attribute attach failed during active upload", 0);
+                                if (transfer)
+                                {
+                                    // reduce the number of required attributes to let the upload continue
+                                    transfer->minfa--;
+                                    checkfacompletion(fa->th.uploadHandle());
+                                    sendevent(99407,"Attribute attach failed during active upload", 0);
+                                }
+                                else
+                                {
+                                    LOG_debug << "Transfer related to failed attribute not found: " << fa->th;
+                                }
                             }
                         }
 
                         delete fa;
-                        activefa.erase(erasePos);
+                        curfa = activefa.erase(curfa);
                         LOG_debug << "Remaining file attributes: " << activefa.size() << " active, " << queuedfa.size() << " queued";
                         btpfa.reset();
                         faretrying = false;
@@ -1693,38 +1684,15 @@ void MegaClient::exec()
                     case REQ_FAILURE:
                         // repeat request with exponential backoff
                         LOG_warn << "Error setting file attribute";
-                        activefa.erase(erasePos);
+                        curfa = activefa.erase(curfa);
                         fa->status = REQ_READY;
                         queuedfa.push_back(fa);
                         btpfa.backoff();
                         faretrying = true;
                         break;
 
-                    case REQ_INFLIGHT:
-                        // check if the transfer/file was cancelled while we were waiting for fa response (only for file uploads, not Node updates or app-requested fa put)
-                        if (!fa->th.isNodeHandle())
-                        {
-                            if (auto uploadFAPtr = fileAttributesUploading.lookupExisting(fa->th.uploadHandle()))
-                            {
-                                uploadFAPtr->transfer->removeCancelledTransferFiles(&committer);
-                                if (uploadFAPtr->transfer->files.empty())
-                                {
-                                    // this also removes it from slots and fileAttributesUploading
-                                    activefa.erase(erasePos);
-                                    uploadFAPtr->transfer->removeAndDeleteSelf(TRANSFERSTATE_CANCELLED);
-                                }
-                            }
-                            else
-                            {
-                                LOG_debug << "activefa for " << fa->th.uploadHandle() << " has been orphaned, discarding";
-                                activefa.erase(erasePos);
-                            }
-                        }
-                        break;
-
                     default:
-                        // other cases are not relevant for this one
-                        break;
+                        curfa++;
                 }
             }
         }
@@ -1741,7 +1709,7 @@ void MegaClient::exec()
                 activefa.push_back(fa);
 
                 LOG_debug << "Adding file attribute to the request queue";
-                fa->status = REQ_GET_URL;   // will become REQ_INFLIGHT after we get the URL and start data upload.  Don't delete while the reqs subsystem would end up with a dangling pointer
+                fa->status = REQ_INFLIGHT;
                 reqs.add(fa);
             }
         }
@@ -1897,8 +1865,6 @@ void MegaClient::exec()
                         {
                             if (*pendingcs->in.c_str() == '[')
                             {
-                                CodeCounter::ScopeTimer ccst(performanceStats.csSuccessProcessingTime);
-
                                 if (fetchingnodes && fnstats.timeToFirstByte == NEVER)
                                 {
                                     WAIT_CLASS::bumpds();
@@ -1942,10 +1908,10 @@ void MegaClient::exec()
                                     }
                                 }
 
-                                if (auto completion = std::move(mOnCSCompletion))
+                                if (mOnCSCompletion)
                                 {
-                                    assert(mOnCSCompletion == nullptr);
-                                    completion(this);
+                                    mOnCSCompletion(this);
+                                    mOnCSCompletion = nullptr;
                                 }
                             }
                             else
@@ -2491,7 +2457,7 @@ void MegaClient::exec()
 
         if (!mBlocked) // handle active unpaused transfers
         {
-            TransferDbCommitter committer(tctable);
+            DBTableTransactionCommitter committer(tctable);
 
             while (slotit != tslots.end())
             {
@@ -2499,14 +2465,7 @@ void MegaClient::exec()
 
                 slotit++;
 
-                // remove transfer files whose MegaTransfer associated has been cancelled (via cancel token)
-                (*it)->transfer->removeCancelledTransferFiles(&committer);
-                if ((*it)->transfer->files.empty())
-                {
-                    // this also removes it from slots
-                    (*it)->transfer->removeAndDeleteSelf(TRANSFERSTATE_CANCELLED);
-                }
-                else if (!xferpaused[(*it)->transfer->type] && (!(*it)->retrying || (*it)->retrybt.armed()))
+                if (!xferpaused[(*it)->transfer->type] && (!(*it)->retrying || (*it)->retrybt.armed()))
                 {
                     (*it)->doio(this, committer);
                 }
@@ -2749,9 +2708,7 @@ void MegaClient::exec()
                                         LOG_debug << "Pending MEGA nodes: " << synccreate.size();
                                         if (!syncadding)
                                         {
-                                            LOG_debug << "Running syncup to create missing folders: "
-                                                      << toHandle(sync->getConfig().mBackupId);
-
+                                            LOG_debug << "Running syncup to create missing folders";
                                             syncup(sync->localroot.get(), &nds);
                                             sync->cachenodes();
                                         }
@@ -2770,7 +2727,7 @@ void MegaClient::exec()
                                     // FIXME: defer this until RETRY queue is processed
                                     sync->scanseqno++;
 
-                                    TransferDbCommitter committer(tctable);  //  just one db transaction to remove all the LocalNodes that get deleted
+                                    DBTableTransactionCommitter committer(tctable);  //  just one db transaction to remove all the LocalNodes that get deleted
                                     sync->deletemissing(sync->localroot.get());
                                 }
                             }
@@ -2919,9 +2876,7 @@ void MegaClient::exec()
                                 if ((sync->state() == SYNC_ACTIVE || sync->state() == SYNC_INITIALSCAN)
                                  && !syncadding && syncuprequired && !syncnagleretry)
                                 {
-                                    LOG_debug << "Running syncup on demand: "
-                                              << toHandle(sync->getConfig().mBackupId);
-
+                                    LOG_debug << "Running syncup on demand";
                                     repeatsyncup |= !syncup(sync->localroot.get(), &nds);
                                     syncupdone = true;
                                     sync->cachenodes();
@@ -2971,7 +2926,7 @@ void MegaClient::exec()
                                         if (sync->fullscan)
                                         {
                                             // recursively delete all LocalNodes that were deleted (not moved or renamed!)
-                                            TransferDbCommitter committer(tctable);  //  just one db transaction to remove all the LocalNodes that get deleted
+                                            DBTableTransactionCommitter committer(tctable);  //  just one db transaction to remove all the LocalNodes that get deleted
                                             sync->deletemissing(sync->localroot.get());
                                             sync->cachenodes();
                                         }
@@ -3066,9 +3021,7 @@ void MegaClient::exec()
                             LocalPath localpath = sync->localroot->localname;
                             if (sync->state() == SYNC_ACTIVE || sync->state() == SYNC_INITIALSCAN)
                             {
-                                LOG_debug << "Running syncdown on demand: "
-                                          << toHandle(sync->getConfig().mBackupId);
-
+                                LOG_debug << "Running syncdown on demand";
                                 if (!syncdown(sync->localroot.get(), localpath))
                                 {
                                     // a local filesystem item was locked - schedule periodic retry
@@ -3196,12 +3149,11 @@ void MegaClient::exec()
     }
 
 #ifdef MEGA_MEASURE_CODE
-    ccst.complete();
     performanceStats.transfersActiveTime.start(!tslots.empty() && !performanceStats.transfersActiveTime.inprogress());
     performanceStats.transfersActiveTime.stop(tslots.empty() && performanceStats.transfersActiveTime.inprogress());
 
     static auto lasttime = Waiter::ds;
-    if (Waiter::ds > lasttime + 30)
+    if (Waiter::ds > lasttime + 1200)
     {
         lasttime = Waiter::ds;
         LOG_info << performanceStats.report(false, httpio, waiter, reqs);
@@ -3638,31 +3590,6 @@ bool MegaClient::abortbackoff(bool includexfers)
 // activate enough queued transfers as necessary to keep the system busy - but not too busy
 void MegaClient::dispatchTransfers()
 {
-    if (CancelToken::haveAnyCancelsOccurredSince(lastKnownCancelCount))
-    {
-        // first deal with the possibility of cancelled transfers
-        // only do this if any cancel tokens were activated
-        // as walking the whole list on every exec() would be too expensive for large sets of transfers
-        static direction_t putget[] = { PUT, GET };
-        for (direction_t direction : putget)
-        {
-            TransferDbCommitter committer(tctable);
-            auto& directionList = transfers[direction];
-            for (auto i = directionList.begin(); i != directionList.end(); )
-            {
-                auto it = i++;  // in case this entry is removed
-                Transfer* transfer = it->second;
-
-                transfer->removeCancelledTransferFiles(&committer);
-                if (transfer->files.empty())
-                {
-                    // this also removes it from slots
-                    transfer->removeAndDeleteSelf(TRANSFERSTATE_CANCELLED);
-                }
-            }
-        }
-    }
-
     // do we have any transfer slots available?
     if (!slotavail())
     {
@@ -3750,9 +3677,7 @@ void MegaClient::dispatchTransfers()
             return true;
         };
 
-    TransferDbCommitter committer(tctable);
-
-    std::array<vector<Transfer*>, 6> nextInCategory = transferlist.nexttransfers(testAddTransferFunction, continueDirection, committer);
+    std::array<vector<Transfer*>, 6> nextInCategory = transferlist.nexttransfers(testAddTransferFunction, continueDirection);
 
     // Iterate the 4 combinations in this order:
     static const TransferCategory categoryOrder[] = {
@@ -3761,6 +3686,8 @@ void MegaClient::dispatchTransfers()
         TransferCategory(PUT, SMALLFILE),
         TransferCategory(GET, SMALLFILE),
     };
+
+    DBTableTransactionCommitter committer(tctable);
 
     for (auto category : categoryOrder)
     {
@@ -3990,17 +3917,7 @@ void MegaClient::dispatchTransfers()
                             if (!gfxdisabled && gfx && gfx->isgfx(nexttransfer->localfilename))
                             {
                                 // we want all imagery to be safely tucked away before completing the upload, so we bump minfa
-                                int bitmask = gfx->gendimensionsputfa(ts->fa, nexttransfer->localfilename, NodeOrUploadHandle(nexttransfer->uploadhandle), nexttransfer->transfercipher(), -1);
-
-                                if (bitmask & (1 << GfxProc::THUMBNAIL))
-                                {
-                                    fileAttributesUploading.setFileAttributePending(nexttransfer->uploadhandle, GfxProc::THUMBNAIL, nexttransfer);
-                                }
-
-                                if (bitmask & (1 << GfxProc::PREVIEW))
-                                {
-                                    fileAttributesUploading.setFileAttributePending(nexttransfer->uploadhandle, GfxProc::PREVIEW, nexttransfer);
-                                }
+                                nexttransfer->minfa += gfx->gendimensionsputfa(ts->fa, nexttransfer->localfilename, NodeOrUploadHandle(nexttransfer->uploadhandle), nexttransfer->transfercipher(), -1);
                             }
                         }
                     }
@@ -4140,52 +4057,58 @@ void MegaClient::dispatchTransfers()
 }
 
 // do we have an upload that is still waiting for file attributes before being completed?
-void MegaClient::checkfacompletion(UploadHandle th, Transfer* t, bool uploadCompleted)
+void MegaClient::checkfacompletion(UploadHandle th, Transfer* t)
 {
-    // For any particular transfer, this is called first with t supplied, when the file's data upload completes.
-    // Calls after that are with !t, to check if we have all the file attributes yet, so we can make the putnodes call
-    assert(!th.isUndef());
-
-    if (auto uploadFAPtr = fileAttributesUploading.lookupExisting(th))
+    if (!th.isUndef())
     {
-        assert(!t || uploadFAPtr->transfer == t);
-        t = uploadFAPtr->transfer;
+        bool delayedcompletion;
+        uploadhandletransfer_map::iterator htit;
 
-        if (uploadCompleted)
+        if ((delayedcompletion = !t))
         {
-            uploadFAPtr->uploadCompleted = true;
+            // abort if upload still running
+            if ((htit = faputcompletion.find(th)) == faputcompletion.end())
+            {
+                LOG_debug << "Upload still running checking a file attribute - " << th;
+                return;
+            }
 
-            transfers[t->type].erase(t->transfers_it);
-            t->transfers_it = transfers[t->type].end();
-
-            delete t->slot;
-            t->slot = NULL;
+            t = htit->second;
         }
 
-        // abort if upload still running
-        if (!uploadFAPtr->uploadCompleted)
+        int facount = 0;
+
+        // do we have the pre-set threshold number of file attributes available? complete upload.
+        for (fa_map::iterator it = pendingfa.lower_bound(pair<UploadHandle, fatype>(th, fatype(0)));
+             it != pendingfa.end() && it->first.first == th; it++)
         {
-            LOG_debug << "Upload still running checking a file attribute - " << th;
-            return;
+            facount++;
         }
 
-        assert(uploadFAPtr->transfer && uploadFAPtr->transfer->type == PUT);
-
-        // do we have all the required the file attributes available? complete upload.
-        int numUnresolvedFA = 0;
-        for (auto& i : uploadFAPtr->pendingfa)
+        if (facount < t->minfa)
         {
-            if (!i.second.valueIsSet) ++numUnresolvedFA;  // todo: fa_media
-        }
+            LOG_debug << "Pending file attributes for upload - " << th <<  " : " << (t->minfa < facount);
+            if (!delayedcompletion)
+            {
+                // we have insufficient file attributes available: remove transfer and put on hold
+                t->faputcompletion_it = faputcompletion.insert(pair<UploadHandle, Transfer*>(th, t)).first;
 
-        if (numUnresolvedFA)
-        {
-            LOG_debug << "Pending file attributes for upload - " << th <<  " : " << numUnresolvedFA;
+                transfers[t->type].erase(t->transfers_it);
+                t->transfers_it = transfers[t->type].end();
+
+                delete t->slot;
+                t->slot = NULL;
+
+                LOG_debug << "Transfer put on hold. Total: " << faputcompletion.size();
+            }
+
             return;
         }
     }
-
-    if (!t) return;
+    else
+    {
+        LOG_warn << "NULL file attribute handle";
+    }
 
     LOG_debug << "Transfer finished, sending callbacks - " << th;
     t->state = TRANSFERSTATE_COMPLETED;
@@ -4198,7 +4121,7 @@ void MegaClient::checkfacompletion(UploadHandle th, Transfer* t, bool uploadComp
 // clear transfer queue
 void MegaClient::freeq(direction_t d)
 {
-    TransferDbCommitter committer(tctable);
+    DBTableTransactionCommitter committer(tctable);
     for (auto transferPtr : transfers[d])
     {
         transferPtr.second->mOptimizedDelete = true;  // so it doesn't remove itself from this list while deleting
@@ -4308,20 +4231,14 @@ void MegaClient::abortlockrequest()
     disconnecttimestamp = NEVER;
 }
 
-void MegaClient::logout(bool keepSyncConfigsFile, CommandLogout::Completion completion)
+void MegaClient::logout(bool keepSyncConfigsFile)
 {
-    // Avoids us having to check validity later.
-    if (!completion)
-    {
-        completion = [](error) { };
-    }
-
     if (loggedin() != FULLACCOUNT)
     {
         locallogout(true, keepSyncConfigsFile);
 
         restag = reqtag;
-        completion(API_OK);
+        app->logout_result(API_OK);
         reportLoggedInChanges();
         return;
     }
@@ -4336,7 +4253,7 @@ void MegaClient::logout(bool keepSyncConfigsFile, CommandLogout::Completion comp
     }
 #endif
 
-    reqs.add(new CommandLogout(this, std::move(completion), keepSyncConfigsFile));
+    reqs.add(new CommandLogout(this, keepSyncConfigsFile));
 }
 
 void MegaClient::locallogout(bool removecaches, bool keepSyncsConfigFile)
@@ -4463,7 +4380,7 @@ void MegaClient::locallogout(bool removecaches, bool keepSyncsConfigFile)
 
     fafcs.clear();
 
-    fileAttributesUploading.clear();
+    pendingfa.clear();
 
     // erase keys & session ID
     resetKeyring();
@@ -4757,7 +4674,7 @@ bool MegaClient::procsc()
 
                         if (tctable && cachedfiles.size())
                         {
-                            TransferDbCommitter committer(tctable);
+                            DBTableTransactionCommitter committer(tctable);
                             for (unsigned int i = 0; i < cachedfiles.size(); i++)
                             {
                                 direction_t type = NONE;
@@ -5319,9 +5236,6 @@ void MegaClient::finalizesc(bool complete)
 // queue node file attribute for retrieval or cancel retrieval
 error MegaClient::getfa(handle h, string *fileattrstring, const string &nodekey, fatype t, int cancel)
 {
-    assert((cancel && nodekey.empty()) ||
-          (!cancel && !nodekey.empty()));
-
     // locate this file attribute type in the nodes's attribute string
     handle fah;
     int p, pp;
@@ -5423,23 +5337,21 @@ void MegaClient::pendingattrstring(UploadHandle h, string* fa)
 {
     char buf[128];
 
-    if (auto uploadFAPtr = fileAttributesUploading.lookupExisting(h))
+    for (fa_map::iterator it = pendingfa.lower_bound(pair<UploadHandle, fatype>(h, fatype(0)));
+         it != pendingfa.end() && it->first.first == h; )
     {
-        for (auto& it : uploadFAPtr->pendingfa)
+        if (it->first.second != fa_media)
         {
-            if (it.first != fa_media)
-            {
-                sprintf(buf, "/%u*", (unsigned)it.first);
-                Base64::btoa((byte*)&it.second.fileAttributeHandle, sizeof(it.second.fileAttributeHandle), strchr(buf + 3, 0));
-                fa->append(buf + !fa->size());
-                LOG_debug << "Added file attribute " << it.first << " to putnodes";
-            }
+            sprintf(buf, "/%u*", (unsigned)it->first.second);
+            Base64::btoa((byte*)&it->second.first, sizeof(it->second.first), strchr(buf + 3, 0));
+            fa->append(buf + !fa->size());
+            LOG_debug << "Added file attribute to putnodes. Remaining: " << pendingfa.size()-1;
         }
+        pendingfa.erase(it++);
     }
 }
 
-// Upload file attribute data to fa servers. node handle can be UNDEF if we are giving fa handle back to the app
-// Used for attaching file attribute to a Node, or prepping for Node creation after upload, or getting fa handle for app.
+// attach file attribute to a file (th can be upload or node handle)
 // FIXME: to avoid unnecessary roundtrips to the attribute servers, also cache locally
 void MegaClient::putfa(NodeOrUploadHandle th, fatype t, SymmCipher* key, int tag, std::unique_ptr<string> data)
 {
@@ -5457,7 +5369,7 @@ void MegaClient::putfa(NodeOrUploadHandle th, fatype t, SymmCipher* key, int tag
         HttpReqCommandPutFA *fa = *curfa;
         queuedfa.erase(curfa);
         activefa.push_back(fa);
-        fa->status = REQ_GET_URL;  // will become REQ_INFLIGHT after we get the URL and start data upload.  Don't delete while the reqs subsystem would end up with a dangling pointer
+        fa->status = REQ_INFLIGHT;
         reqs.add(fa);
     }
 }
@@ -7387,7 +7299,7 @@ void MegaClient::notifypurge(void)
             }
         });
 #endif
-        TransferDbCommitter committer(tctable);
+        DBTableTransactionCommitter committer(tctable);
 
         // check all notified nodes for removed status and purge
         for (i = 0; i < t; i++)
@@ -7945,11 +7857,6 @@ error MegaClient::putnodes_prepareOneFile(NewNode* newnode, Node* parentNode, co
 
 void MegaClient::putnodes_prepareOneFolder(NewNode* newnode, std::string foldername, std::function<void(AttrMap&)> addAttrs)
 {
-    MegaClient::putnodes_prepareOneFolder(newnode, foldername, rng, tmpnodecipher, addAttrs);
-}
-
-void MegaClient::putnodes_prepareOneFolder(NewNode* newnode, std::string foldername, PrnGen& rng, SymmCipher& tmpnodecipher, std::function<void(AttrMap&)> addAttrs)
-{
     string attrstring;
     byte buf[FOLDERNODEKEYLENGTH];
 
@@ -8118,11 +8025,6 @@ error MegaClient::checkmove(Node* fn, Node* tn)
 // modify the 'n' attribute)
 error MegaClient::rename(Node* n, Node* p, syncdel_t syncdel, NodeHandle prevparent, const char *newName, CommandMoveNode::Completion&& c)
 {
-    if (mBizStatus == BIZ_STATUS_EXPIRED)
-    {
-        return API_EBUSINESSPASTDUE;
-    }
-
     error e;
 
     if ((e = checkmove(n, p)))
@@ -8244,11 +8146,6 @@ void MegaClient::removeOutSharesFromSubtree(Node* n, int tag)
 // delete node tree
 error MegaClient::unlink(Node* n, bool keepversions, int tag, std::function<void(NodeHandle, Error)>&& resultFunction)
 {
-    if (mBizStatus == BIZ_STATUS_EXPIRED)
-    {
-        return API_EBUSINESSPASTDUE;
-    }
-
     if (!n->inshare && !checkaccess(n, FULL))
     {
         return API_EACCESS;
@@ -8727,13 +8624,13 @@ int MegaClient::readnodes(JSON* j, int notify, putsource_t source, vector<NewNod
                     if (rootnodes.files.isUndef())
                     {
                         rootnodes.files.set6byte(h);
+                    }
 
-                        if (loggedIntoWritableFolder())
-                        {
-                            // If logged into writable folder, we need the sharekey set in the root node
-                            // so as to include it in subsequent put nodes
-                            n->sharekey = new SymmCipher(key); //we use the "master key", in this case the secret share key
-                        }
+                    if (loggedIntoWritableFolder())
+                    {
+                        // If logged into writable folder, we need the sharekey set in the root node
+                        // so as to include it in subsequent put nodes
+                        n->sharekey = new SymmCipher(key); //we use the "master key", in this case the secret share key
                     }
                 }
 
@@ -8805,6 +8702,22 @@ int MegaClient::readnodes(JSON* j, int notify, putsource_t source, vector<NewNod
                         }
                     }
 #endif
+
+                    if (nn_nni.source == NEW_UPLOAD)
+                    {
+                        UploadHandle uh = nn_nni.uploadhandle;
+
+                        // do we have pending file attributes for this upload? set them.
+                        for (fa_map::iterator it = pendingfa.lower_bound(pair<UploadHandle, fatype>(uh, fatype(0)));
+                             it != pendingfa.end() && it->first.first == uh; )
+                        {
+                            reqs.add(new CommandAttachFA(this, h, it->first.second, it->second.first, it->second.second));
+                            pendingfa.erase(it++);
+                        }
+
+                        // FIXME: only do this for in-flight FA writes
+                        uhnh.insert(pair<UploadHandle, NodeHandle>(uh, NodeHandle().set6byte(h)));
+                    }
                 }
             }
 
@@ -8820,37 +8733,13 @@ int MegaClient::readnodes(JSON* j, int notify, putsource_t source, vector<NewNod
         }
     }
 
-    // any child nodes arrived before their parents?
-    size_t count = 0;
-    node_vector orphans;
+    // any child nodes that arrived before their parents?
     for (size_t i = dp.size(); i--; )
     {
         if ((n = nodebyhandle(dp[i]->parenthandle)))
         {
             dp[i]->setparent(n);
-            ++count;
         }
-        else if (dp[i]->type < ROOTNODE)    // rootnodes have no parent
-        {
-            orphans.push_back(dp[i]);
-        }
-    }
-
-    mergenewshares(notify);
-
-    // detect if there's any orphan node and report to API
-    for (auto orphan : orphans)
-    {
-        // top-level inshares have no parent (nested ones have)
-        if (orphan->inshare)
-        {
-            ++count;
-        }
-    }
-    if (dp.size() != count)
-    {
-       LOG_err << "Detected orphan nodes: " << dp.size() - count;
-       sendevent(99455, "Orphan node(s) detected");
     }
 
     return j->leavearray();
@@ -10869,41 +10758,41 @@ void MegaClient::notifynode(Node* n)
     }
 }
 
-void MegaClient::transfercacheadd(Transfer *transfer, TransferDbCommitter* committer)
+void MegaClient::transfercacheadd(Transfer *transfer, DBTableTransactionCommitter* committer)
 {
     if (tctable && !transfer->skipserialization)
     {
-        if (committer) committer->addTransferCount += 1;
+        LOG_debug << "Caching transfer";
         tctable->checkCommitter(committer);
         tctable->put(MegaClient::CACHEDTRANSFER, transfer, &tckey);
     }
 }
 
-void MegaClient::transfercachedel(Transfer *transfer, TransferDbCommitter* committer)
+void MegaClient::transfercachedel(Transfer *transfer, DBTableTransactionCommitter* committer)
 {
     if (tctable && transfer->dbid)
     {
-        if (committer) committer->removeTransferCount += 1;
+        LOG_debug << "Removing cached transfer";
         tctable->checkCommitter(committer);
         tctable->del(transfer->dbid);
     }
 }
 
-void MegaClient::filecacheadd(File *file, TransferDbCommitter& committer)
+void MegaClient::filecacheadd(File *file, DBTableTransactionCommitter& committer)
 {
     if (tctable && !file->syncxfer)
     {
-        committer.addFileCount += 1;
+        LOG_debug << "Caching file";
         tctable->checkCommitter(&committer);
         tctable->put(MegaClient::CACHEDFILE, file, &tckey);
     }
 }
 
-void MegaClient::filecachedel(File *file, TransferDbCommitter* committer)
+void MegaClient::filecachedel(File *file, DBTableTransactionCommitter* committer)
 {
     if (tctable && !file->syncxfer)
     {
-        if (committer) committer->removeFileCount += 1;
+        LOG_debug << "Removing cached file";
         tctable->checkCommitter(committer);
         tctable->del(file->dbid);
     }
@@ -12320,7 +12209,7 @@ void MegaClient::purgeOrphanTransfers(bool remove)
 
     for (int d = GET; d == GET || d == PUT; d += PUT - GET)
     {
-        TransferDbCommitter committer(tctable);
+        DBTableTransactionCommitter committer(tctable);
         while (cachedtransfers[d].size())
         {
             transfer_map::iterator it = cachedtransfers[d].begin();
@@ -12399,7 +12288,7 @@ void MegaClient::enabletransferresumption(const char *loggedoutid)
     LOG_info << "Loading transfers from local cache";
     tctable->rewind();
     {
-        TransferDbCommitter committer(tctable); // needed in case of tctable->del()
+        DBTableTransactionCommitter committer(tctable);
         while (tctable->next(&id, &data, &tckey))
         {
             switch (id & 15)
@@ -12438,7 +12327,7 @@ void MegaClient::enabletransferresumption(const char *loggedoutid)
     // postpone the resumption until the filesystem is updated
     if ((!sid.size() && !loggedinfolderlink()) || statecurrent)
     {
-        TransferDbCommitter committer(tctable);
+        DBTableTransactionCommitter committer(tctable);
         for (unsigned int i = 0; i < cachedfiles.size(); i++)
         {
             direction_t type = NONE;
@@ -12562,9 +12451,6 @@ void MegaClient::fetchnodes(bool nocache)
             scsn.setScsn(cachedscsn);
             LOG_info << "Session loaded from local cache. SCSN: " << scsn.text()
                      << " node count: " << nodes.size() << " user count: " << users.size();
-
-            assert(nodes.size() > 0);   // sometimes this is not true; if you see it, please investigate why (before we alter the db)
-            assert(!rootnodes.files.isUndef());  // we should know this by now - if not, why not, please investigate (before we alter the db)
 
             if (loggedIntoWritableFolder())
             {
@@ -13841,7 +13727,6 @@ error MegaClient::checkSyncConfig(SyncConfig& syncConfig, LocalPath& rootpath, s
         // Currently only possible for backup syncs.
         if (!syncConfig.isBackup())
         {
-            LOG_warn << "Only Backups can be external";
             return API_EARGS;
         }
 
@@ -13886,7 +13771,7 @@ error MegaClient::checkSyncConfig(SyncConfig& syncConfig, LocalPath& rootpath, s
             error e = isLocalPathSyncable(syncConfig.getLocalPath(), syncConfig.mBackupId, &syncConfig.mError);
             if (e)
             {
-                LOG_warn << "Local path not syncable: " << syncConfig.getLocalPath();
+                LOG_warn << "Local path not syncable: ";
 
                 if (syncConfig.mError == NO_SYNC_ERROR)
                 {
@@ -13898,7 +13783,6 @@ error MegaClient::checkSyncConfig(SyncConfig& syncConfig, LocalPath& rootpath, s
         }
         else
         {
-            LOG_warn << "Cannot sync non-folder";
             syncConfig.mError = INVALID_LOCAL_TYPE;
             syncConfig.mEnabled = false;
             return API_EACCESS;    // cannot sync individual files
@@ -13906,7 +13790,6 @@ error MegaClient::checkSyncConfig(SyncConfig& syncConfig, LocalPath& rootpath, s
     }
     else
     {
-        LOG_warn << "Cannot open rootpath for sync: " << rootpath;
         syncConfig.mError = openedLocalFolder->retry ? LOCAL_PATH_TEMPORARY_UNAVAILABLE : LOCAL_PATH_UNAVAILABLE;
         syncConfig.mEnabled = false;
         return openedLocalFolder->retry ? API_ETEMPUNAVAIL : API_ENOENT;
@@ -14097,7 +13980,6 @@ error MegaClient::addsync(SyncConfig& config, bool notifyApp, std::function<void
 
     if (e)
     {
-        // the cause is already logged in checkSyncConfig
         completion(e, config.mError, UNDEF);
         return e;
     }
@@ -14165,7 +14047,6 @@ error MegaClient::addsync(SyncConfig& config, bool notifyApp, std::function<void
 
         if (e)
         {
-            LOG_warn << "Failed to register heartbeat record for new sync. Error: " << int(e);
             completion(e, config.mError, backupId);
         }
         else
@@ -14203,7 +14084,7 @@ handle MegaClient::nextsyncid()
 }
 
 // recursively stop all transfers
-void MegaClient::stopxfers(LocalNode* l, TransferDbCommitter& committer)
+void MegaClient::stopxfers(LocalNode* l, DBTableTransactionCommitter& committer)
 {
     if (l->type != FILENODE)
     {
@@ -14259,16 +14140,11 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath)
 
     SyncdownContext cxt;
 
+    cxt.mActionsPerformed = false;
+
     if (!syncdown(l, localpath, cxt))
     {
         return false;
-    }
-
-    if (cxt.mBackupForeignChangeDetected)
-    {
-        assert(l->sync->isBackup());
-
-        return true;
     }
 
     if (!l->sync->isBackupAndMirroring())
@@ -14278,13 +14154,11 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath)
 
     bool mirrorStable = true;
 
-    assert(l->sync->isBackup());
-
     // SCs must have been processed.
     mirrorStable &= statecurrent;
 
     // Syncdown must not have performed any actions.
-    mirrorStable &= !cxt.mBackupActionsPerformed;
+    mirrorStable &= !cxt.mActionsPerformed;
 
     // Scan queue must be empty.
     mirrorStable &= l->sync->dirnotify->empty();
@@ -14323,10 +14197,7 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
     remotenode_map nchildren;
     remotenode_map::iterator rit;
 
-    // Set to false if we encounter any transient errors while trying to
-    // perform an operation on the local filesystem such as creating a
-    // directory or moving a file.
-    bool noTransientErrors = true;
+    bool success = true;
 
     // build array of sync-relevant (in case of clashes, the newest alias wins)
     // remote children by name
@@ -14394,7 +14265,7 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                 if (l->sync->isBackupAndMirroring())
                 {
                     // Mirror hasn't stabilized yet.
-                    cxt.mBackupActionsPerformed = true;
+                    cxt.mActionsPerformed = true;
 
                     // Detach the remote, re-upload if necessary.
                     ll->detach(true);
@@ -14404,14 +14275,8 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                 }
                 else if (l->sync->isBackupMonitoring())
                 {
-                    // Let the caller know we've detected a foreign change.
-                    cxt.mBackupForeignChangeDetected = true;
-
-                    // Disable the sync and return to our caller.
-                    l->sync->backupModified();
-
-                    // Don't forget to signal any other error conditions.
-                    return noTransientErrors;
+                    // Disable the sync and tell our caller we've failed.
+                    return l->sync->backupModified();
                 }
             }
             else if (ll->type == FILENODE)
@@ -14466,7 +14331,7 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                     if (rit->second->localnode && rit->second->localnode->transfer)
                     {
                         LOG_debug << "Stopping an unneeded upload";
-                        TransferDbCommitter committer(tctable);
+                        DBTableTransactionCommitter committer(tctable);
                         stopxfer(rit->second->localnode, &committer);  // TODO: can we have one transaction for recursing through syncdown() ?
                     }
 
@@ -14485,14 +14350,9 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                 }
 
                 // recurse into directories of equal name
-                noTransientErrors &= syncdown(ll, localpath, cxt);
-
-                // Bail if the callee detected a foreign change.
-                if (cxt.mBackupForeignChangeDetected)
+                if (!syncdown(ll, localpath, cxt) && success)
                 {
-                    assert(l->sync->isBackup());
-
-                    return noTransientErrors;
+                    success = false;
                 }
 
                 nchildren.erase(rit);
@@ -14523,7 +14383,7 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
             if (l->sync->isBackupAndMirroring())
             {
                 // Mirror hasn't stabilized.
-                cxt.mBackupActionsPerformed = true;
+                cxt.mActionsPerformed = true;
 
                 // Re-upload the node.
                 ll->created = false;
@@ -14531,14 +14391,8 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
             }
             else if (l->sync->isBackupMonitoring())
             {
-                // Let our caller know there's been a foreign change.
-                cxt.mBackupForeignChangeDetected = true;
-
-                // Disable the sync and return to the caller.
-                l->sync->backupModified();
-
-                // Make sure we persist any (other) error condition.
-                return noTransientErrors;
+                // Disable the sync and tell our caller we've failed.
+                return l->sync->backupModified();
             }
 
             if (ll->deleted)
@@ -14548,14 +14402,14 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
 
                 if (l->sync->movetolocaldebris(localpath) || !fsaccess->transient_error)
                 {
-                    TransferDbCommitter committer(tctable);
+                    DBTableTransactionCommitter committer(tctable);
                     delete lit++->second;
                 }
                 else
                 {
                     blockedfile = localpath;
                     LOG_warn << "Transient error deleting " << blockedfile;
-                    noTransientErrors = false;
+                    success = false;
                     lit++;
                 }
             }
@@ -14565,7 +14419,7 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
             if (l->sync->isBackupAndMirroring())
             {
                 // Local node needs to be uploaded.
-                cxt.mBackupActionsPerformed |= !ll->node;
+                cxt.mActionsPerformed |= !ll->node;
             }
 
             lit++;
@@ -14594,7 +14448,7 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
             if (l->sync->isBackupAndMirroring())
             {
                 // Mirror hasn't stabilized.
-                cxt.mBackupActionsPerformed = true;
+                cxt.mActionsPerformed = true;
 
                 // Detach the remote, re-upload the local if necessary.
                 rit->second->detach(true);
@@ -14604,14 +14458,8 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
             }
             else if (l->sync->isBackupMonitoring())
             {
-                // Let the caller know we've detected a foreign change.
-                cxt.mBackupForeignChangeDetected = true;
-
-                // Disable the sync and return to our caller.
-                l->sync->backupModified();
-
-                // Make sure to signal any other error conditions.
-                return noTransientErrors;
+                // Disable the sync and tell our caller we've failed.
+                return l->sync->backupModified();
             }
             else if (rit->second->localnode->parent)
             {
@@ -14647,12 +14495,12 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
 
                     rit->second->localnode->treestate(TREESTATE_SYNCED);
                 }
-                else if (noTransientErrors && fsaccess->transient_error)
+                else if (success && fsaccess->transient_error)
                 {
                     // schedule retry
                     blockedfile = curpath;
                     LOG_debug << "Transient error moving localnode " << blockedfile;
-                    noTransientErrors = false;
+                    success = false;
                 }
             }
             else
@@ -14694,21 +14542,15 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                         if (l->sync->isBackupAndMirroring())
                         {
                             // Mirror hasn't stabilized.
-                            cxt.mBackupActionsPerformed = true;
+                            cxt.mActionsPerformed = true;
 
                             // Debris the remote.
                             movetosyncdebris(rit->second, l->sync->inshare);
                         }
                         else if (l->sync->isBackupMonitoring())
                         {
-                            // Let the caller know we've detected a foreign change.
-                            cxt.mBackupForeignChangeDetected = true;
-
-                            // Disable the sync and return to the caller.
-                            l->sync->backupModified();
-
-                            // Make sure to signal any other error conditions.
-                            return noTransientErrors;
+                            // Disable sync and let the caller know we've failed.
+                            return l->sync->backupModified();
                         }
                         else
                         {
@@ -14716,11 +14558,9 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
 
                             rit->second->syncget = new SyncFileGet(l->sync, rit->second, localpath);
                             nextreqtag();
-                            TransferDbCommitter committer(tctable); // TODO: use one committer for all files in the loop, without calling syncdown() recursively
-                            error result = API_OK;
-
-                            startxfer(GET, rit->second->syncget, committer, false, false, false, UseLocalVersioningFlag, &result);
-                            syncactivity |= result != LOCAL_ENOSPC;
+                            DBTableTransactionCommitter committer(tctable); // TODO: use one committer for all files in the loop, without calling syncdown() recursively
+                            startxfer(GET, rit->second->syncget, committer, false, false, false, UseLocalVersioningFlag);
+                            syncactivity = true;
                         }
                     }
                 }
@@ -14735,21 +14575,15 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                 else if (l->sync->isBackupAndMirroring())
                 {
                     // Mirror hasn't stabilized.
-                    cxt.mBackupActionsPerformed = true;
+                    cxt.mActionsPerformed = true;
 
                     // Remove the remote.
                     movetosyncdebris(rit->second, l->sync->inshare);
                 }
                 else if (l->sync->isBackupMonitoring())
                 {
-                    // Let the caller know we've detected a foreign change.
-                    cxt.mBackupForeignChangeDetected = true;
-
-                    // Disable the sync and return the caller.
-                    l->sync->backupModified();
-
-                    // Don't forget to signal other error conditions.
-                    return noTransientErrors;
+                    // Disable the sync as we have a mismatch.
+                    return l->sync->backupModified();
                 }
                 else
                 {
@@ -14778,10 +14612,10 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                             ll->setnode(rit->second);
                             ll->sync->statecacheadd(ll);
 
-                            if (!syncdown(ll, localpath, cxt) && noTransientErrors)
+                            if (!syncdown(ll, localpath, cxt) && success)
                             {
                                 LOG_debug << "Syncdown not finished";
-                                noTransientErrors = false;
+                                success = false;
                             }
                         }
                         else
@@ -14789,11 +14623,11 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
                             LOG_debug << "Checkpath() failed " << (ll == NULL);
                         }
                     }
-                    else if (noTransientErrors && fsaccess->transient_error)
+                    else if (success && fsaccess->transient_error)
                     {
                         blockedfile = localpath;
                         LOG_debug << "Transient error creating folder " << blockedfile;
-                        noTransientErrors = false;
+                        success = false;
                     }
                     else if (!fsaccess->transient_error)
                     {
@@ -14804,7 +14638,7 @@ bool MegaClient::syncdown(LocalNode* l, LocalPath& localpath, SyncdownContext& c
         }
     }
 
-    return noTransientErrors;
+    return success;
 }
 
 // recursively traverse tree of LocalNodes and match with remote Nodes
@@ -14999,7 +14833,7 @@ bool MegaClient::syncup(LocalNode* l, dstime* nds, size_t& parentPending)
                         if (rit->second->syncget)
                         {
                             LOG_debug << "Stopping unneeded download";
-                            TransferDbCommitter committer(tctable);
+                            DBTableTransactionCommitter committer(tctable);
                             delete rit->second->syncget;
                             rit->second->syncget = NULL;
                         }
@@ -15008,7 +14842,7 @@ bool MegaClient::syncup(LocalNode* l, dstime* nds, size_t& parentPending)
                         if (ll->transfer)
                         {
                             LOG_debug << "Stopping unneeded upload";
-                            TransferDbCommitter committer(tctable);
+                            DBTableTransactionCommitter committer(tctable);
                             stopxfer(ll, &committer);  // todo:  can we use just one commiter for all of the recursive syncup() calls?
                         }
 
@@ -15332,10 +15166,7 @@ bool MegaClient::syncup(LocalNode* l, dstime* nds, size_t& parentPending)
             }
 
             // create remote folder or send file
-            LOG_debug << "Adding local file to synccreate: "
-                      << ll->getLocalPath()
-                      << " "
-                      << synccreate.size();
+            LOG_debug << "Adding local file to synccreate: " << ll->name << " " << synccreate.size();
             synccreate.push_back(ll);
             syncactivity = true;
 
@@ -15410,7 +15241,7 @@ void MegaClient::syncupdate()
         vector<NewNode> nn;
         nn.reserve(end - start);
 
-        TransferDbCommitter committer(tctable);
+        DBTableTransactionCommitter committer(tctable);
         for (i = start; i < end; i++)
         {
             n = NULL;
@@ -15468,9 +15299,7 @@ void MegaClient::syncupdate()
                         tattrs.map.erase(it);
                     }
 
-                    LOG_debug << "Sync - creating remote file "
-                              << l->getLocalPath()
-                              << " by copying existing remote file";
+                    LOG_debug << "Sync - creating remote file " << l->name << " by copying existing remote file";
                 }
                 else
                 {
@@ -15892,52 +15721,14 @@ void MegaClient::putnodes_syncdebris_result(error, vector<NewNode>& nn)
 // inject file into transfer subsystem
 // if file's fingerprint is not valid, it will be obtained from the local file
 // (PUT) or the file's key (GET)
-bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committer, bool skipdupes, bool startfirst, bool donotpersist, VersioningOption vo, error* cause)
+bool MegaClient::startxfer(direction_t d, File* f, DBTableTransactionCommitter& committer, bool skipdupes, bool startfirst, bool donotpersist, VersioningOption vo)
 {
     f->mVersioningOption = vo;
-
-    // Dummy to avoid checking later.
-    if (!cause)
-    {
-        // Initializer provided to silence warnings.
-        static error dummy = API_OK;
-
-        cause = &dummy;
-    }
-
-    // Is caller trying to start a download?
-    if (d == GET)
-    {
-        auto targetPath = f->localname.parentPath();
-
-        assert(f->size >= 0);
-
-        // Do we have enough space for the download?
-        if (fsaccess->availableDiskSpace(targetPath) <= f->size)
-        {
-            LOG_warn << "Insufficient space available for download: "
-                     << f->localname
-                     << ": "
-                     << f->size;
-
-            *cause = LOCAL_ENOSPC;
-
-            return false;
-        }
-    }
 
     if (!f->transfer)
     {
         if (d == PUT)
         {
-            if (!nodeByHandle(f->h) && (f->targetuser != SUPPORT_USER_HANDLE))
-            {
-                // the folder to upload is unknown - perhaps this is a resumed transfer
-                // and the folder was deleted in the meantime
-                *cause = API_EARGS;
-                return false;
-            }
-
             if (!f->isvalid)    // (sync LocalNodes always have this set)
             {
                 // missing FileFingerprint for local file - generate
@@ -15953,9 +15744,6 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
             if (!f->isvalid)
             {
                 LOG_err << "Unable to get a fingerprint " << f->name;
-
-                *cause = API_EREAD;
-
                 return false;
             }
 
@@ -15990,9 +15778,6 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
                                 && f->name == (*fi)->name))
                     {
                         LOG_warn << "Skipping duplicated transfer";
-
-                        *cause = API_EEXIST;
-
                         return false;
                     }
                 }
@@ -16030,6 +15815,7 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
             it = cachedtransfers[d].find(f);
             if (it != cachedtransfers[d].end())
             {
+                LOG_debug << "Resumable transfer detected";
                 t = it->second;
                 bool hadAnyData = t->pos > 0;
                 if ((d == GET && !t->pos) || ((m_time() - t->lastaccesstime) >= 172500))
@@ -16053,11 +15839,7 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
                 {
                     if (d == PUT)
                     {
-                        if (!localpath.empty())
-                        {
-                            // if empty, we had not started the upload. The real path is in the first File
-                            LOG_warn << "Local file not found: " << localpath;
-                        }
+                        LOG_warn << "Local file not found: " << localpath;
                         // the transfer will be retried to ensure that the file
                         // is not just just temporarily blocked
                     }
@@ -16147,13 +15929,11 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
                 || (!f->h.isUndef() && (nodeByHandle(f->h) || d == GET) )); // target handle for the upload should be known at this time (except for inbox uploads)
     }
 
-    *cause = API_OK;
-
     return true;
 }
 
 // remove file from transfer subsystem
-void MegaClient::stopxfer(File* f, TransferDbCommitter* committer)
+void MegaClient::stopxfer(File* f, DBTableTransactionCommitter* committer)
 {
     if (f->transfer)
     {
@@ -16166,7 +15946,10 @@ void MegaClient::stopxfer(File* f, TransferDbCommitter* committer)
         if (!transfer->files.size())
         {
             looprequested = true;
-            transfer->removeAndDeleteSelf(TRANSFERSTATE_CANCELLED);
+            transfer->finished = true;
+            transfer->state = TRANSFERSTATE_CANCELLED;
+            app->transfer_removed(transfer);
+            delete transfer;
         }
         else
         {
@@ -16180,7 +15963,7 @@ void MegaClient::stopxfer(File* f, TransferDbCommitter* committer)
 }
 
 // pause/unpause transfers
-void MegaClient::pausexfers(direction_t d, bool pause, bool hard, TransferDbCommitter& committer)
+void MegaClient::pausexfers(direction_t d, bool pause, bool hard, DBTableTransactionCommitter& committer)
 {
     xferpaused[d] = pause;
 
@@ -16976,7 +16759,6 @@ std::string MegaClient::PerformanceStats::report(bool reset, HttpIO* httpio, Wai
         << doWait.report(reset) << "\n"
         << checkEvents.report(reset) << "\n"
         << execFunction.report(reset) << "\n"
-        << megaapiSendPendingTransfers.report(reset) << "\n"
         << transferslotDoio.report(reset) << "\n"
         << execdirectreads.report(reset) << "\n"
         << transferComplete.report(reset) << "\n"
@@ -16984,7 +16766,6 @@ std::string MegaClient::PerformanceStats::report(bool reset, HttpIO* httpio, Wai
         << applyKeys.report(reset) << "\n"
         << scProcessingTime.report(reset) << "\n"
         << csResponseProcessingTime.report(reset) << "\n"
-        << csSuccessProcessingTime.report(reset) << "\n"
         << " cs Request waiting time: " << csRequestWaitTime.report(reset) << "\n"
         << " cs requests sent/received: " << reqs.csRequestsSent << "/" << reqs.csRequestsCompleted << " batches: " << reqs.csBatchesSent << "/" << reqs.csBatchesReceived << "\n"
         << " transfers active time: " << transfersActiveTime.report(reset) << "\n"

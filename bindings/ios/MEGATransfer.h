@@ -41,16 +41,6 @@ typedef NS_ENUM (NSInteger, MEGATransferState) {
     MEGATransferStateFailed
 };
 
-typedef NS_ENUM (NSUInteger, MEGATransferStage) {
-    MEGATransferStageNone = 0,
-    MEGATransferStageScan,
-    MEGATransferStageCreateTree,
-    MEGATransferStageGenTransfers,
-    MEGATransferStageProcessTransferQueue,
-    MEGATransferStageTransferringFiles,
-    MEGATransferStageMax = MEGATransferStageTransferringFiles,
-};
-
 /**
  * @brief Provides information about a transfer.
  *
@@ -295,23 +285,6 @@ typedef NS_ENUM (NSUInteger, MEGATransferStage) {
 @property (readonly, nonatomic) MEGATransferState state;
 
 /**
- * @brief The current stage in case this transfer represents a recursive operation.
- * This method can return the following values:
- *  - MEGATransferStageScan                      = 1
- *  - MEGATransferStageCreateTreee               = 2
- *  - MEGATransferStageGenTransfers              = 3
- *  - MEGATransferStageProcessTransferQueue      = 4
- *  - MEGATransferStageTransferringFiles         = 5
- * Any other returned value, must be ignored.
- *
- * Note: a recursive operation (folder upload/download) can be cancelled using a MEGACancelToken,
- * but this cancellation mechanism will only have effect between the following stages:
- * MEGATransferStageScan and MEGATransferStageProcessTransferQueue both included.
- *
- */
-@property (readonly, nonatomic) MEGATransferStage stage;
-
-/**
  * @brief Returns the priority of the transfer
  *
  * This value is intended to keep the order of the transfer queue on apps.
@@ -319,13 +292,6 @@ typedef NS_ENUM (NSUInteger, MEGATransferStage) {
  * @return Priority of the transfer
  */
 @property (readonly, nonatomic) unsigned long long priority;
-
-/**
- * @brief Returns a string that identify the recursive operation stage
- *
- * @return A string that identify the recursive operation stage
- */
-+ (NSString *)stringForTransferStage:(MEGATransferStage)stage;
 
 /**
  * @brief Returns the notification number of the SDK when this MEGATransfer was generated
